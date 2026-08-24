@@ -1,0 +1,26 @@
+# Python (backend)
+india-ivf-hms-backend/venv/
+india-ivf-hms-backend/_to_delete/
+**/__pycache__/
+*.pyc
+db.sqlite3
+
+# Node / Next.js (frontend)
+india-ivf-hms-next/node_modules/
+india-ivf-hms-next/.next/
+india-ivf-hms-next/out/
+*.tsbuildinfo
+
+# Backup of the frontend's old standalone git history (kept locally, not tracked)
+india-ivf-hms-next/.git.gitlab-backup/
+
+# Env / secrets
+.env
+.env.*
+*.pem
+
+# Claude Code local (machine-specific) settings
+.claude/settings.local.json
+
+# OS
+.DS_Store

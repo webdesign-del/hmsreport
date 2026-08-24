@@ -1,0 +1,136 @@
+@import "tailwindcss";
+
+:root {
+  --color-bg: #FBF7F4;
+  --color-surface: #FFFFFF;
+  --color-surface-2: #FBF6F2;
+  --color-primary: #A23B6C;
+  --color-primary-dark: #7C2B51;
+  --color-primary-soft: #F6E6EE;
+  --color-gold: #C99A4E;
+  --color-gold-soft: #F6ECD9;
+  --color-blue: #4A7BA6;
+  --color-blue-soft: #E5EFF6;
+  --color-text: #2E2A2C;
+  --color-text-mid: #6B6168;
+  --color-text-soft: #9A8F95;
+  --color-border: #EEE4DC;
+  --color-border-soft: #F4ECE5;
+  --color-green: #4C9A78;
+  --color-green-soft: #E6F1EB;
+  --color-amber: #D69B3E;
+  --color-amber-soft: #FAF0DC;
+  --color-red: #CF5B57;
+  --color-red-soft: #FAE6E5;
+  --shadow-card: 0 1px 2px rgba(60, 40, 50, .04), 0 6px 22px rgba(120, 70, 95, .06);
+  --radius-card: 14px;
+}
+
+@theme inline {
+  --color-bg: var(--color-bg);
+  --color-surface: var(--color-surface);
+  --color-surface-2: var(--color-surface-2);
+  --color-primary: var(--color-primary);
+  --color-primary-dark: var(--color-primary-dark);
+  --color-primary-soft: var(--color-primary-soft);
+  --color-gold: var(--color-gold);
+  --color-gold-soft: var(--color-gold-soft);
+  --color-blue: var(--color-blue);
+  --color-blue-soft: var(--color-blue-soft);
+  --color-text: var(--color-text);
+  --color-text-mid: var(--color-text-mid);
+  --color-text-soft: var(--color-text-soft);
+  --color-border: var(--color-border);
+  --color-border-soft: var(--color-border-soft);
+  --color-green: var(--color-green);
+  --color-green-soft: var(--color-green-soft);
+  --color-amber: var(--color-amber);
+  --color-amber-soft: var(--color-amber-soft);
+  --color-red: var(--color-red);
+  --color-red-soft: var(--color-red-soft);
+  --font-sans: var(--font-inter);
+  --font-display: var(--font-poppins);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  height: 100%;
+}
+
+body {
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-inter), system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1, h2, h3, h4 {
+  font-family: var(--font-poppins), var(--font-inter), sans-serif;
+  font-weight: 600;
+  letter-spacing: -.01em;
+}
+
+@keyframes screen-fade {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+
+.screen-enter {
+  animation: screen-fade .25s ease;
+}
+
+/* thin branded scrollbar for wide tables */
+.scroll-thin::-webkit-scrollbar { height: 10px; width: 10px; }
+.scroll-thin::-webkit-scrollbar-thumb { background: var(--color-border); border-radius: 6px; }
+.scroll-thin::-webkit-scrollbar-track { background: transparent; }
+
+/* ============ data tables ============ */
+@layer components {
+  table.tbl {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12.5px;
+    white-space: nowrap;
+  }
+  table.tbl th {
+    text-align: left;
+    padding: 10px 14px;
+    background: var(--color-surface-2);
+    color: var(--color-text-soft);
+    font-weight: 600;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: .03em;
+    border-bottom: 1px solid var(--color-border);
+  }
+  table.tbl td {
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--color-border-soft);
+    color: var(--color-text-mid);
+    vertical-align: top;
+  }
+  table.tbl tbody tr:hover td { background: var(--color-surface-2); }
+  table.tbl .col-num { text-align: right; font-variant-numeric: tabular-nums; }
+  table.tbl .strong { color: var(--color-text); font-weight: 600; }
+  table.tbl .sn-col { color: var(--color-text-soft); width: 36px; }
+  table.tbl .sticky-l { position: sticky; left: 0; background: var(--color-surface); z-index: 1; }
+  .pt-name { font-weight: 600; color: var(--color-text); white-space: nowrap; }
+  .pt-id { font-size: 11px; color: var(--color-text-soft); }
+  .iic-link, .bpl-iic {
+    color: var(--color-primary);
+    font-weight: 600;
+    cursor: pointer;
+    text-decoration: underline;
+    text-decoration-color: transparent;
+    transition: text-decoration-color .12s;
+  }
+  .iic-link:hover, .bpl-iic:hover { text-decoration-color: var(--color-primary); }
+  .cell-empty { color: var(--color-text-soft); }
+  .cell-bold { font-weight: 600; color: var(--color-text); }
+  .cell-sub { font-size: 11px; color: var(--color-text-soft); margin-top: 2px; }
+}
