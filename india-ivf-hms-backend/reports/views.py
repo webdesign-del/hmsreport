@@ -845,7 +845,7 @@ def get_prebook_data(request):
         LEFT JOIN hms_doctors d ON d.ID = hc.doctor_id
         LEFT JOIN hms_centers c ON c.center_number = hc.billing_at
         LEFT JOIN reports_patientcnb r
-            ON r.patient_id = COALESCE(NULLIF(TRIM(a.paitent_id), ''), CAST(a.id AS CHAR))
+            ON r.patient_id = CONVERT(COALESCE(NULLIF(TRIM(a.paitent_id), ''), CAST(a.id AS CHAR)) USING utf8mb4) COLLATE utf8mb4_general_ci
         WHERE hc.appointment_id NOT IN (SELECT DISTINCT appointment_id FROM hms_patient_procedure)
         ORDER BY hc.on_date DESC;
     """

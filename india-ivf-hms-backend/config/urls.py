@@ -36,6 +36,8 @@ urlpatterns = [
     path('procedure-billing/', views.procedure_billing_view, name='procedure_billing_view'),
 
     # API Endpoints (Next.js aur Frontend ke liye)
+    path('api/login/', views.login_view, name='api_login'),
+    path('api/logout/', views.logout_view, name='api_logout'),
     path('api/get_cnb_data/', views.get_cnb_data, name='get_cnb_data'),
     path('api/save_cnb_edits/', views.save_cnb_edits, name='save_cnb_edits'),
     path('api/get_procedure_billing_data/', views.get_procedure_billing_data, name='get_procedure_billing_data'),
