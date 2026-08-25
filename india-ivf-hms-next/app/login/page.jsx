@@ -65,8 +65,8 @@ const res = await fetch('/api/login/', {
       }
     } catch (err) {
       console.error('Login Exception:', err);
-      // Fallback network/CORS error message
-      setError('Unable to connect to Django Auth API on http://127.0.0.1:8000');
+      // Dynamic Error Handling
+      setError(err?.message || 'Server connection failed. Please try again.');
     } finally {
       setLoading(false);
     }
