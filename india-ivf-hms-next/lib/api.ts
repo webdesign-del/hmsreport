@@ -27,8 +27,10 @@ async function getJSON<T>(path: string): Promise<T> {
 }
 
 export const getPatients = () => getJSON<Patient[]>("/api/patients");
-export const getPrebook = () => getJSON<PrebookPatient[]>("/api/prebook");
-export const getTriggers = () => getJSON<TriggerItem[]>("/api/triggers");
+export const getPrebook = (centerId?: number | null) =>
+  getJSON<PrebookPatient[]>(`/api/prebook${centerId ? `?center_id=${centerId}` : ""}`);
+export const getTriggers = (centerId?: number | null) =>
+  getJSON<TriggerItem[]>(`/api/triggers${centerId ? `?center_id=${centerId}` : ""}`);
 export const getApprovals = () => getJSON<Approval[]>("/api/approvals");
 export const getOverrides = () => getJSON<OverrideLog[]>("/api/overrides");
 export const getDonors = () => getJSON<Donor[]>("/api/donors");
@@ -60,4 +62,5 @@ export interface AgingSnapshotResponse {
   byCentre: { centre: string; buckets: number[]; total: number }[];
   patients: AgingPatient[];
 }
-export const getAgingSnapshot = () => getJSON<AgingSnapshotResponse>("/api/aging-snapshot");
+export const getAgingSnapshot = (centerId?: number | null) =>
+  getJSON<AgingSnapshotResponse>(`/api/aging-snapshot${centerId ? `?center_id=${centerId}` : ""}`);

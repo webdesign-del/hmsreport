@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { fmtINR } from "@/lib/format";
+import { getClientScopedCenterId } from "@/lib/clientSession";
 import { BarTrack, Card, PageHead, TableWrap } from "@/components/ui";
 
 interface CentreRow {
@@ -24,9 +25,11 @@ export default function CentreComparisonLive() {
       setError("");
 
       // Try multiple host fallbacks to bypass localhost/127.0.0.1 origin blocks
+      const centerId = getClientScopedCenterId();
+      const qs = centerId ? `?center_id=${centerId}` : "";
       const apiUrls = [
-        "http://127.0.0.1:8000/api/get_centre_comparison/",
-        "http://localhost:8000/api/get_centre_comparison/",
+        `http://127.0.0.1:8000/api/get_centre_comparison/${qs}`,
+        `http://localhost:8000/api/get_centre_comparison/${qs}`,
       ];
 
       let response: Response | null = null;

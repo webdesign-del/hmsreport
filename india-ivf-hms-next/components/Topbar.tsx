@@ -1,9 +1,76 @@
+"use client";
+
+import { useEffect, useState } from "react";
 import Image from "next/image";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 
 const CENTRES = ["All Centres", "Vasant Vihar", "Rohini", "Noida", "Gurgaon", "Ghaziabad", "Srinagar"];
 
+const ROLE_LABEL: Record<string, string> = {
+  doctor: "Doctor",
+  centre_head: "Centre Head",
+  fc: "Financial Counsellor",
+  accounts: "Accounts Team",
+  management: "Management",
+};
+
+interface UserSession {
+  username: string;
+  name: string;
+  role: string;
+  centerId?: number | null;
+  centerName?: string | null;
+}
+
+const SCOPED_ROLES = new Set(["doctor", "centre_head", "fc", "accounts"]);
+
+function initials(name: string): string {
+  const parts = name.trim().split(/\s+/);
+  return ((parts[0]?.[0] || "") + (parts[1]?.[0] || "")).toUpperCase() || "U";
+}
+
 export default function Topbar() {
+  const router = useRouter();
+  const [session, setSession] = useState<UserSession | null>(null);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem("user_session");
+      if (raw) setSession(JSON.parse(raw));
+    } catch {
+      // ignore malformed session
+    }
+  }, []);
+
+  useEffect(() => {
+    const onChange = () => setIsFullscreen(!!document.fullscreenElement);
+    document.addEventListener("fullscreenchange", onChange);
+    return () => document.removeEventListener("fullscreenchange", onChange);
+  }, []);
+
+  function toggleFullscreen() {
+    if (document.fullscreenElement) {
+      document.exitFullscreen();
+    } else {
+      document.documentElement.requestFullscreen();
+    }
+  }
+
+  function handleLogout() {
+    localStorage.removeItem("user_session");
+    document.cookie = "user_session=; path=/; max-age=0";
+    router.push("/login");
+  }
+
+  const displayName = session?.name || session?.username || "Guest";
+  const roleLabel = session ? ROLE_LABEL[session.role] || session.role : "Not signed in";
+  // center_id 0 is the "IndiaIVF" head-office placeholder (unassigned) — treat as unscoped,
+  // matching the data-fetch behaviour in lib/auth.ts / lib/clientSession.ts.
+  const isScoped = !!session && SCOPED_ROLES.has(session.role) && !!session.centerId;
+
   return (
     <header className="sticky top-0 z-50 flex h-[62px] items-center gap-[18px] border-b border-border bg-surface px-[22px]">
       <Link href="/dashboard" className="flex items-center gap-3.5">
@@ -14,31 +81,64 @@ export default function Topbar() {
       <div className="h-[30px] w-px bg-border" />
       <div className="font-display text-[13px] font-semibold text-primary-dark">Management Workspace</div>
       <div className="ml-auto flex items-center gap-3">
-        <div className="flex items-center gap-[7px] rounded-[9px] border border-border bg-surface-2 px-3 py-[7px] text-xs font-semibold text-text-mid">
+        <div
+          className="flex items-center gap-[7px] rounded-[9px] border border-border bg-surface-2 px-3 py-[7px] text-xs font-semibold text-text-mid"
+          title={isScoped ? "Your access is scoped to this centre" : undefined}
+        >
           <span>📍</span>
-          <select
-            defaultValue="All Centres"
-            className="cursor-pointer border-none bg-transparent text-xs font-semibold text-primary-dark outline-none"
-          >
-            {CENTRES.map((c) => (
-              <option key={c}>{c}</option>
-            ))}
-          </select>
+          {isScoped ? (
+            <span className="text-primary-dark">{session?.centerName || "Your Centre"}</span>
+          ) : (
+            <select
+              defaultValue="All Centres"
+              className="cursor-pointer border-none bg-transparent text-xs font-semibold text-primary-dark outline-none"
+            >
+              {CENTRES.map((c) => (
+                <option key={c}>{c}</option>
+              ))}
+            </select>
+          )}
         </div>
         <button
           type="button"
+          onClick={() => router.push("/login")}
           className="rounded-[9px] border border-border bg-surface px-3 py-[7px] text-xs font-semibold text-text-mid transition-colors hover:border-primary hover:text-primary"
         >
           ⇄ Switch role
         </button>
-        <div className="flex items-center gap-2.5">
-          <div className="flex h-[34px] w-[34px] flex-none items-center justify-center rounded-full bg-gradient-to-br from-gold to-[#b9863c] text-[13px] font-semibold text-white">
-            DS
-          </div>
-          <div className="leading-[1.15]">
-            <div className="text-[12.5px] font-semibold">Dr. Somendra</div>
-            <div className="text-[11px] text-text-soft">Director · All Centres</div>
-          </div>
+        <button
+          type="button"
+          onClick={toggleFullscreen}
+          title={isFullscreen ? "Exit full screen" : "Enter full screen"}
+          className="flex h-[30px] w-[30px] items-center justify-center rounded-[9px] border border-border bg-surface text-sm text-text-mid transition-colors hover:border-primary hover:text-primary"
+        >
+          {isFullscreen ? "⤢" : "⛶"}
+        </button>
+        <div className="relative">
+          <button
+            type="button"
+            onClick={() => setMenuOpen((o) => !o)}
+            className="flex items-center gap-2.5 rounded-[9px] px-1.5 py-1 hover:bg-surface-2"
+          >
+            <div className="flex h-[34px] w-[34px] flex-none items-center justify-center rounded-full bg-gradient-to-br from-gold to-[#b9863c] text-[13px] font-semibold text-white">
+              {initials(displayName)}
+            </div>
+            <div className="text-left leading-[1.15]">
+              <div className="text-[12.5px] font-semibold">{displayName}</div>
+              <div className="text-[11px] text-text-soft">{roleLabel}</div>
+            </div>
+          </button>
+          {menuOpen && (
+            <div className="absolute right-0 top-[calc(100%+8px)] w-44 overflow-hidden rounded-[10px] border border-border bg-surface shadow-lg">
+              <button
+                type="button"
+                onClick={handleLogout}
+                className="flex w-full items-center gap-2 px-3.5 py-2.5 text-left text-[12.5px] font-semibold text-red transition-colors hover:bg-red-soft"
+              >
+                ⏻ Log out
+              </button>
+            </div>
+          )}
         </div>
       </div>
     </header>

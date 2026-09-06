@@ -46,4 +46,5 @@ urlpatterns = [
     path('api/get_centre_comparison/', views.get_centre_comparison, name='get_centre_comparison'),
     path('api/get_aging_snapshot/', views.get_aging_snapshot, name='get_aging_snapshot'),
     path('api/get_prebook_data/', views.get_prebook_data, name='get_prebook_data'),
+    path('api/get_red_triggers/', views.get_red_triggers, name='get_red_triggers'),
 ]

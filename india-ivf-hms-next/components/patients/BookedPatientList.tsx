@@ -2,6 +2,7 @@
 
 import { useMemo, useState, useEffect } from "react";
 import Link from "next/link";
+import { getClientScopedCenterId } from "@/lib/clientSession";
 
 const inputCls = "w-full rounded-[9px] border border-border bg-surface px-3 py-2 text-[12.5px] outline-none focus:border-primary";
 
@@ -20,7 +21,9 @@ export default function BookedPatientList() {
     try {
       setLoading(true);
       setError("");
-      const res = await fetch("http://127.0.0.1:8000/api/get_dynamic_booked_patients/", {
+      const centerId = getClientScopedCenterId();
+      const qs = centerId ? `?center_id=${centerId}` : "";
+      const res = await fetch(`http://127.0.0.1:8000/api/get_dynamic_booked_patients/${qs}`, {
         cache: "no-store",
       });
 

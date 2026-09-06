@@ -12,6 +12,15 @@ from django.contrib import messages
 # 1. LEGACY HMS_DOCTORS DIRECT AUTHENTICATION & SESSIONS
 # ============================================================
 
+# Maps the workspace button clicked on the frontend to the hms_employees.role value
+EMPLOYEE_WORKSPACE_ROLES = {
+    'centre_head': 'center_head',
+    'fc': 'counselor',
+    'accounts': 'accountant',
+    'management': 'viewer',
+}
+
+
 @csrf_exempt
 def login_view(request):
     if request.method == "POST":
@@ -21,12 +30,15 @@ def login_view(request):
                 data = json.loads(request.body)
                 username_input = data.get('username')
                 password_input = data.get('password')
+                role_input = data.get('role')
             except Exception:
                 username_input = request.POST.get('username')
                 password_input = request.POST.get('password')
+                role_input = request.POST.get('role')
         else:
             username_input = request.POST.get('username')
             password_input = request.POST.get('password')
+            role_input = request.POST.get('role')
 
         if not username_input or not password_input:
             return JsonResponse({'status': 'error', 'message': 'Username and password are required.'}, status=400)
@@ -34,11 +46,58 @@ def login_view(request):
         # MD5 hashing logic sequence matching standard
         password_md5 = hashlib.md5(password_input.encode('utf-8')).hexdigest()
 
+        # Non-doctor workspaces (Centre Head, Financial Counsellor, Accounts Team,
+        # Management) authenticate against hms_employees, scoped to their DB role.
+        if role_input in EMPLOYEE_WORKSPACE_ROLES:
+            expected_role = EMPLOYEE_WORKSPACE_ROLES[role_input]
+            employee_query = """
+                SELECT e.id, e.name, e.email, e.username, e.password, e.role, e.status, e.center_id, c.center_name
+                FROM hms_employees e
+                LEFT JOIN hms_centers c ON e.center_id = c.center_number
+                WHERE (e.username = %s OR e.email = %s) AND e.role = %s
+                LIMIT 1;
+            """
+            with connection.cursor() as cursor:
+                cursor.execute(employee_query, [username_input, username_input, expected_role])
+                employee_row = cursor.fetchone()
+
+            if employee_row:
+                emp_id, emp_name, emp_email, emp_username, emp_password, emp_role, emp_status, emp_center_id, emp_center_name = employee_row
+
+                if emp_password == password_md5 or emp_password == password_input:
+                    if not emp_status:
+                        return JsonResponse({'status': 'error', 'message': 'This account has been deactivated.'}, status=403)
+
+                    request.session['employee_id'] = emp_id
+                    request.session['employee_name'] = emp_name
+                    request.session['employee_email'] = emp_email
+                    request.session['employee_username'] = emp_username
+                    request.session['employee_center_id'] = emp_center_id
+                    request.session['user_role'] = emp_role
+
+                    return JsonResponse({
+                        'status': 'success',
+                        'message': 'Logged in successfully',
+                        'user': {
+                            'id': emp_id,
+                            'name': emp_name,
+                            'email': emp_email,
+                            'username': emp_username,
+                            'role': emp_role,
+                            'center_id': emp_center_id,
+                            'center_name': emp_center_name,
+                        }
+                    })
+
+            return JsonResponse({'status': 'error', 'message': 'Invalid credentials or username context.'}, status=400)
+
+        # Default / 'doctor' workspace: legacy hms_doctors direct authentication.
         # Query checks against BOTH username and email
         query = """
-            SELECT ID, name, email, username, password 
-            FROM hms_doctors 
-            WHERE (username = %s OR email = %s)
+            SELECT d.ID, d.name, d.email, d.username, d.password, d.center_id, c.center_name, d.allowed_centers
+            FROM hms_doctors d
+            LEFT JOIN hms_centers c ON d.center_id = c.center_number
+            WHERE (d.username = %s OR d.email = %s)
             LIMIT 1;
         """
 
@@ -47,8 +106,8 @@ def login_view(request):
             doctor_row = cursor.fetchone()
 
         if doctor_row:
-            db_id, db_name, db_email, db_username, db_password = doctor_row
-            
+            db_id, db_name, db_email, db_username, db_password, db_center_id, db_center_name, db_allowed_centers = doctor_row
+
             # Check MD5 hash OR Plain-text fallback
             if db_password == password_md5 or db_password == password_input:
                 request.session['doctor_id'] = db_id
@@ -57,6 +116,12 @@ def login_view(request):
                 request.session['doctor_username'] = db_username
                 request.session['user_role'] = 'doctor'
 
+                # A doctor with more than one entry in allowed_centers works across centres
+                # (e.g. a director-level account) and should see all centres, not just their
+                # home center_id.
+                allowed_list = [c.strip() for c in (db_allowed_centers or '').split(',') if c.strip()]
+                is_multi_centre = len(allowed_list) > 1
+
                 return JsonResponse({
                     'status': 'success',
                     'message': 'Logged in successfully',
@@ -64,7 +129,9 @@ def login_view(request):
                         'id': db_id,
                         'name': db_name,
                         'email': db_email,
-                        'username': db_username
+                        'username': db_username,
+                        'center_id': None if is_multi_centre else db_center_id,
+                        'center_name': None if is_multi_centre else db_center_name,
                     }
                 })
 
@@ -264,17 +331,21 @@ def get_procedure_billing_data(request):
 
 
 def get_dynamic_booked_patients(request):
-    query = """
-        SELECT 
+    center_id = request.GET.get('center_id')
+    centre_filter_sql = "AND p.billing_at = %s" if center_id else ""
+    params = [center_id] if center_id else []
+
+    query = f"""
+        SELECT
             MIN(a.id) AS appointment_internal_id,
             COALESCE(NULLIF(TRIM(a.paitent_id), ''), CAST(a.id AS CHAR)) AS patient_id,
-            MIN(a.wife_name) AS name, 
+            MIN(a.wife_name) AS name,
             MIN(a.husband_name) AS husband_name,
-            MIN(p.receipt_number) AS receipt_number, 
+            MIN(p.receipt_number) AS receipt_number,
             MIN(a.appoitmented_date) AS date,
             MIN(p.on_date) AS on_date,
-            MIN(p.councellor) AS councellor, 
-            MIN(c.center_name) AS center_name, 
+            MIN(p.councellor) AS councellor,
+            MIN(c.center_name) AS center_name,
             MIN(d.name) AS doctor_name,
             GROUP_CONCAT(DISTINCT p.code SEPARATOR ', ') AS code,
             SUM(p.fees) AS fees,
@@ -283,22 +354,23 @@ def get_dynamic_booked_patients(request):
         FROM hms_appointments a
         INNER JOIN hms_patient_procedure p ON a.id = p.appointment_id
         LEFT JOIN hms_doctor_consultation dc ON a.id = dc.appointment_id
-        LEFT JOIN hms_doctors d ON dc.doctor_id = d.ID 
+        LEFT JOIN hms_doctors d ON dc.doctor_id = d.ID
         LEFT JOIN hms_centers c ON p.billing_at = c.center_number
         LEFT JOIN (
-            SELECT billing_id, SUM(payment_done) AS total_paid 
-            FROM hms_patient_payments 
+            SELECT billing_id, SUM(payment_done) AS total_paid
+            FROM hms_patient_payments
             WHERE status IN ('0', '1')
             GROUP BY billing_id
         ) pay_clean ON p.receipt_number = pay_clean.billing_id
-        WHERE a.paitent_type = 'new_patient' 
+        WHERE a.paitent_type = 'new_patient'
           AND a.status = 'consultation_done'
           AND p.status IN ('pending', 'approved')
+          {centre_filter_sql}
         GROUP BY COALESCE(NULLIF(TRIM(a.paitent_id), ''), CAST(a.id AS CHAR))
         ORDER BY MIN(a.appoitmented_date) DESC;
     """
     with connection.cursor() as cursor:
-        cursor.execute(query)
+        cursor.execute(query, params)
         columns = [col[0] for col in cursor.description]
         results = [dict(zip(columns, row)) for row in cursor.fetchall()]
 
@@ -609,7 +681,11 @@ def get_patient_profile_detail(request):
 
 @csrf_exempt
 def get_centre_comparison(request):
-    query = """
+    center_id = request.GET.get('center_id')
+    centre_filter_sql = "WHERE c.center_number = %s" if center_id else ""
+    params = [center_id] if center_id else []
+
+    query = f"""
         SELECT
             c.center_number,
             c.center_name AS CENTRE,
@@ -624,14 +700,15 @@ def get_centre_comparison(request):
             COALESCE(SUM(p.remaining_amount), 0) AS AGING_OUTSTANDING
         FROM hms_centers c
         LEFT JOIN hms_patient_procedure p
-            ON p.billing_at = c.center_number 
+            ON p.billing_at = c.center_number
             AND (p.status IS NULL OR p.status NOT IN ('cancelled', 'disapproved'))
+        {centre_filter_sql}
         GROUP BY c.center_number, c.center_name
         ORDER BY c.center_name ASC;
     """
     try:
         with connection.cursor() as cursor:
-            cursor.execute(query)
+            cursor.execute(query, params)
             columns = [col[0] for col in cursor.description]
             results = [dict(zip(columns, row)) for row in cursor.fetchall()]
 
@@ -657,7 +734,12 @@ def get_centre_comparison(request):
 
 @csrf_exempt
 def get_aging_snapshot(request):
-    by_centre_query = """
+    center_id = request.GET.get('center_id')
+    by_centre_filter_sql = "WHERE c.center_number = %s" if center_id else ""
+    patients_filter_sql = "AND p.billing_at = %s" if center_id else ""
+    params = [center_id] if center_id else []
+
+    by_centre_query = f"""
         SELECT
             c.center_name AS centre,
             COALESCE(SUM(CASE WHEN DATEDIFF(CURDATE(), p.on_date) <= 30 THEN p.remaining_amount ELSE 0 END), 0) AS b0,
@@ -670,11 +752,12 @@ def get_aging_snapshot(request):
             ON p.billing_at = c.center_number
             AND p.remaining_amount > 0
             AND (p.status IS NULL OR p.status NOT IN ('cancelled', 'disapproved'))
+        {by_centre_filter_sql}
         GROUP BY c.center_number, c.center_name
         ORDER BY c.center_name ASC;
     """
 
-    patients_query = """
+    patients_query = f"""
         SELECT
             COALESCE(NULLIF(TRIM(a.paitent_id), ''), CAST(a.id AS CHAR)) AS id,
             a.wife_name AS name,
@@ -695,12 +778,13 @@ def get_aging_snapshot(request):
         LEFT JOIN hms_centers c ON p.billing_at = c.center_number
         WHERE p.remaining_amount > 0
           AND (p.status IS NULL OR p.status NOT IN ('cancelled', 'disapproved'))
+          {patients_filter_sql}
         ORDER BY days_overdue DESC;
     """
 
     try:
         with connection.cursor() as cursor:
-            cursor.execute(by_centre_query)
+            cursor.execute(by_centre_query, params)
             columns = [col[0] for col in cursor.description]
             centre_rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
 
@@ -713,7 +797,7 @@ def get_aging_snapshot(request):
             by_centre.append({"centre": row["centre"], "buckets": buckets, "total": sum(buckets)})
 
         with connection.cursor() as cursor:
-            cursor.execute(patients_query)
+            cursor.execute(patients_query, params)
             columns = [col[0] for col in cursor.description]
             rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
 
@@ -800,7 +884,12 @@ def get_aging_snapshot(request):
 
 @csrf_exempt
 def get_prebook_data(request):
-    scheduled_query = """
+    center_id = request.GET.get('center_id')
+    appt_centre_filter_sql = "AND a.center = %s" if center_id else ""
+    cnb_centre_filter_sql = "AND hc.billing_at = %s" if center_id else ""
+    centre_params = [center_id] if center_id else []
+
+    scheduled_query = f"""
         SELECT
             COALESCE(NULLIF(TRIM(a.paitent_id), ''), CAST(a.id AS CHAR)) AS id,
             a.wife_name AS name,
@@ -809,10 +898,11 @@ def get_prebook_data(request):
         FROM hms_appointments a
         LEFT JOIN hms_centers c ON a.center = c.center_number
         WHERE a.status = 'booked'
+          {appt_centre_filter_sql}
         ORDER BY a.appoitmented_date DESC;
     """
 
-    missed_query = """
+    missed_query = f"""
         SELECT
             COALESCE(NULLIF(TRIM(a.paitent_id), ''), CAST(a.id AS CHAR)) AS id,
             a.wife_name AS name,
@@ -821,6 +911,7 @@ def get_prebook_data(request):
         FROM hms_appointments a
         LEFT JOIN hms_centers c ON a.center = c.center_number
         WHERE a.status = 'no_show'
+          {appt_centre_filter_sql}
         ORDER BY a.appoitmented_date DESC;
     """
 
@@ -828,7 +919,7 @@ def get_prebook_data(request):
     # produced a row in hms_patient_procedure. hms_patient_procedure.appointment_id has no
     # index, so a JOIN against it forces a full nested-loop scan (20-30s+); NOT IN against the
     # small distinct-appointment_id subquery lets MySQL hash it instead, which is near-instant.
-    cnb_query = """
+    cnb_query = f"""
         SELECT
             COALESCE(NULLIF(TRIM(a.paitent_id), ''), CAST(a.id AS CHAR)) AS id,
             a.wife_name AS name,
@@ -847,12 +938,13 @@ def get_prebook_data(request):
         LEFT JOIN reports_patientcnb r
             ON r.patient_id = CONVERT(COALESCE(NULLIF(TRIM(a.paitent_id), ''), CAST(a.id AS CHAR)) USING utf8mb4) COLLATE utf8mb4_general_ci
         WHERE hc.appointment_id NOT IN (SELECT DISTINCT appointment_id FROM hms_patient_procedure)
+          {cnb_centre_filter_sql}
         ORDER BY hc.on_date DESC;
     """
 
     def run(query):
         with connection.cursor() as cursor:
-            cursor.execute(query)
+            cursor.execute(query, centre_params)
             columns = [col[0] for col in cursor.description]
             return [dict(zip(columns, row)) for row in cursor.fetchall()]
 
@@ -899,6 +991,80 @@ def get_prebook_data(request):
                 "fcComment": row["saved_fc_comment"] or "",
                 "lastConn": iso(row["saved_last_conn"]),
                 "lastComment": row["saved_last_comment"] or "",
+            })
+
+        response = JsonResponse(results, safe=False)
+        response["Access-Control-Allow-Origin"] = "*"
+        response["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+        response["Access-Control-Allow-Headers"] = "*"
+        return response
+
+    except Exception as e:
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+
+
+# ============================================================
+# 9. RED TRIGGER PILE-UP (MISSED COLLECTIONS, RANKED BY STAGE)
+# ============================================================
+
+@csrf_exempt
+def get_red_triggers(request):
+    """
+    A patient falls into the pile-up when their journey row still has money
+    owed (balance_amount > 0). The stage they're "stuck" at is the first of
+    Stimulation / Trigger / OPU whose status is still Pending; a miss at OPU
+    is flagged as the most critical trigger type, matching the ranking rule
+    already shown on the /triggers page.
+    """
+    center_id = request.GET.get('center_id')
+    centre_filter_sql = "AND centre_booking = (SELECT center_name FROM hms_centers WHERE center_number = %s)" if center_id else ""
+    params = [center_id] if center_id else []
+
+    query = f"""
+        SELECT
+            patient_id,
+            patients_name,
+            centre_booking,
+            DATE(booking_date) AS booking_date,
+            balance_amount,
+            stimulation_start_status,
+            trigger_status,
+            opu_status,
+            DATEDIFF(CURDATE(), booking_date) AS days_since_booking
+        FROM hms_patient_journey
+        WHERE balance_amount > 0
+          AND booking_date IS NOT NULL
+          {centre_filter_sql}
+        ORDER BY balance_amount DESC;
+    """
+
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(query, params)
+            columns = [col[0] for col in cursor.description]
+            rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+        results = []
+        for r in rows:
+            if (r["opu_status"] or "Pending") != "Done":
+                if (r["trigger_status"] or "Pending") != "Done":
+                    stage = "Stimulation" if (r["stimulation_start_status"] or "Pending") != "Done" else "Trigger"
+                else:
+                    stage = "OPU"
+            else:
+                stage = "Post-OPU"
+
+            trigger_type = "OPU miss" if stage == "OPU" else "Missed collection"
+            days = r["days_since_booking"] or 0
+
+            results.append({
+                "id": str(r["patient_id"]),
+                "type": trigger_type,
+                "name": (r["patients_name"] or "").strip().title(),
+                "centre": r["centre_booking"] or "Unassigned",
+                "stage": stage,
+                "value": float(r["balance_amount"] or 0),
+                "days": int(days),
             })
 
         response = JsonResponse(results, safe=False)

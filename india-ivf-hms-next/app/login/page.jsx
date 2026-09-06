@@ -42,7 +42,7 @@ const res = await fetch('/api/login/', {
   headers: {
     'Content-Type': 'application/json',
   },
-  body: JSON.stringify({ username, password }),
+  body: JSON.stringify({ username, password, role: targetRole }),
 });
 
       const data = await res.json();
@@ -53,6 +53,8 @@ const res = await fetch('/api/login/', {
           username: data.user?.username || username,
           name: data.user?.name || username,
           role: targetRole,
+          centerId: data.user?.center_id ?? null,
+          centerName: data.user?.center_name ?? null,
         };
 
         localStorage.setItem('user_session', JSON.stringify(sessionPayload));

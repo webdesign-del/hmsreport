@@ -2,10 +2,13 @@ import { NextResponse } from "next/server";
 
 const DJANGO_URLS = ["http://127.0.0.1:8000/api/get_prebook_data/", "http://localhost:8000/api/get_prebook_data/"];
 
-export async function GET() {
+export async function GET(request: Request) {
+  const centerId = new URL(request.url).searchParams.get("center_id");
+  const qs = centerId ? `?center_id=${encodeURIComponent(centerId)}` : "";
+
   for (const url of DJANGO_URLS) {
     try {
-      const res = await fetch(url, { cache: "no-store" });
+      const res = await fetch(`${url}${qs}`, { cache: "no-store" });
       if (res.ok) return NextResponse.json(await res.json());
     } catch {
       // try next fallback host

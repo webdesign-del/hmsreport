@@ -1,4 +1,5 @@
 import { getAgingSnapshot } from "@/lib/api";
+import { getScopedCenterId } from "@/lib/auth";
 import { fmtINR } from "@/lib/format";
 import { Card, PageHead, TableWrap } from "@/components/ui";
 import AgingPatientList from "@/components/aging/AgingPatientList";
@@ -7,7 +8,8 @@ const BUCKET_LABELS = ["0 – 30 days", "31 – 60 days", "61 – 90 days", "91 
 const BUCKET_TONE = ["border-t-green", "border-t-blue", "border-t-amber", "border-t-primary", "border-t-red"];
 
 export default async function AgingPage() {
-  const { companyBuckets, bucketCounts, byCentre, patients: agingPatients } = await getAgingSnapshot();
+  const centerId = await getScopedCenterId();
+  const { companyBuckets, bucketCounts, byCentre, patients: agingPatients } = await getAgingSnapshot(centerId);
 
   return (
     <section className="screen-enter">
