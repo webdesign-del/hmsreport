@@ -1,7 +1,6 @@
 import { headers } from "next/headers";
 import type {
   Approval,
-  CentreStat,
   AgingPatient,
   Donor,
   OverrideLog,
@@ -37,25 +36,6 @@ export const getDonors = () => getJSON<Donor[]>("/api/donors");
 export const getSurrogates = () => getJSON<Surrogate[]>("/api/surrogates");
 export const getAgingPatients = () => getJSON<AgingPatient[]>("/api/aging-patients");
 
-export interface CentreStatsResponse {
-  centres: CentreStat[];
-  aging: Record<string, number[]>;
-  companyBuckets: number[];
-  totals: { exp: number; act: number; aging: number };
-  weekTrend: number[];
-}
-export const getCentreStats = () => getJSON<CentreStatsResponse>("/api/centre-stats");
-
-export interface DashboardResponse {
-  kpi: {
-    today: { exp: number; act: number; redTriggers: number; approvalsPending: number };
-    week: { exp: number; act: number; projection: number; redTriggers: number };
-    month: { exp: number; act: number; projection: number; redTriggers: number };
-  };
-  agingBucketCounts: number[];
-}
-export const getDashboard = () => getJSON<DashboardResponse>("/api/dashboard");
-
 export interface AgingSnapshotResponse {
   companyBuckets: number[];
   bucketCounts: number[];
@@ -64,3 +44,28 @@ export interface AgingSnapshotResponse {
 }
 export const getAgingSnapshot = (centerId?: number | null) =>
   getJSON<AgingSnapshotResponse>(`/api/aging-snapshot${centerId ? `?center_id=${centerId}` : ""}`);
+
+export interface DashboardSummaryResponse {
+  kpi: {
+    today: { exp: number; act: number; redTriggers: number; approvalsPending: number };
+    week: { exp: number; act: number; projection: number; redTriggers: number };
+    month: { exp: number; act: number; projection: number; redTriggers: number };
+  };
+  stageLabels: string[];
+  stageCounts: number[];
+  stageByCentre: { centre: string; counts: number[]; total: number }[];
+  weekTrend: number[];
+}
+export const getDashboardSummary = (centerId?: number | null) =>
+  getJSON<DashboardSummaryResponse>(`/api/dashboard-summary${centerId ? `?center_id=${centerId}` : ""}`);
+
+export interface CentreComparisonRow {
+  center_number: string | number;
+  CENTRE: string;
+  EXPECTED: number;
+  ACTUAL: number;
+  COLLECTION_ADHERENCE_PERCENT: number;
+  AGING_OUTSTANDING: number;
+}
+export const getCentreComparison = (centerId?: number | null) =>
+  getJSON<CentreComparisonRow[]>(`/api/centre-comparison${centerId ? `?center_id=${centerId}` : ""}`);

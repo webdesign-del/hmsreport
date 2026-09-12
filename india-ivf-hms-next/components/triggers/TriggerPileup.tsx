@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import Link from "next/link";
 import { fmtINR } from "@/lib/format";
 import { triggerScore } from "@/lib/derive";
 import type { TriggerItem } from "@/lib/types";
@@ -96,9 +97,12 @@ export default function TriggerPileup({ triggers }: { triggers: TriggerItem[] })
                     <td className="col-num">{t.days} d</td>
                     <td className="col-num strong">{triggerScore(t)}</td>
                     <td>
-                      <button type="button" className="rounded-[8px] bg-primary px-3 py-1.5 text-[11px] font-semibold text-white">
+                      <Link
+                        href={`/journey?id=${t.id}`}
+                        className="inline-block rounded-[8px] bg-primary px-3 py-1.5 text-[11px] font-semibold text-white transition-colors hover:bg-primary-dark"
+                      >
                         Review
-                      </button>
+                      </Link>
                     </td>
                   </tr>
                 );

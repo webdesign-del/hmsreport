@@ -2,7 +2,7 @@
 
 import { useMemo, useState, useEffect } from "react";
 import Link from "next/link";
-import { getClientScopedCenterId } from "@/lib/clientSession";
+import { getClientScopedCenterId, getClientSession, hidesFinancials } from "@/lib/clientSession";
 
 const inputCls = "w-full rounded-[9px] border border-border bg-surface px-3 py-2 text-[12.5px] outline-none focus:border-primary";
 
@@ -10,11 +10,16 @@ export default function BookedPatientList() {
   const [patients, setPatients] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-  
+  const [hideFinancials, setHideFinancials] = useState(false);
+
   const [f, setF] = useState({
     search: "",
     centre: "",
   });
+
+  useEffect(() => {
+    setHideFinancials(hidesFinancials(getClientSession()?.role));
+  }, []);
 
   // 1. Live Dynamic Fetching from Django Backend API
   const fetchDynamicPatients = async () => {
@@ -23,7 +28,7 @@ export default function BookedPatientList() {
       setError("");
       const centerId = getClientScopedCenterId();
       const qs = centerId ? `?center_id=${centerId}` : "";
-      const res = await fetch(`http://127.0.0.1:8000/api/get_dynamic_booked_patients/${qs}`, {
+      const res = await fetch(`/api/booked-patients${qs}`, {
         cache: "no-store",
       });
 
@@ -33,7 +38,7 @@ export default function BookedPatientList() {
       setPatients(Array.isArray(data) ? data : []);
     } catch (err: any) {
       console.error("API Fetch Error:", err);
-      setError("Django API Connection Failed! Ensure server is running on http://127.0.0.1:8000");
+      setError("Django API Connection Failed! Ensure the backend server is running.");
     } finally {
       setLoading(false);
     }
@@ -61,21 +66,12 @@ export default function BookedPatientList() {
 
   // Export CSV Function
   function exportCsv() {
-    const headers = ["Patient ID", "Wife Name", "Husband Name", "Appointment Date", "Centre", "Doctor", "Procedure Code", "Gross Fees", "Paid Amount", "Pending Amount"];
+    const headers = ["Patient ID", "Wife Name", "Husband Name", "Appointment Date", "Centre", "Doctor", "Procedure Code"];
+    if (!hideFinancials) headers.push("Gross Fees", "Paid Amount", "Pending Amount");
     const lines = [headers.join(",")];
     filteredRows.forEach((p) => {
-      const cells = [
-        p.patient_id,
-        p.name,
-        p.husband_name || "—",
-        p.date || "—",
-        p.center_name || "—",
-        p.doctor_name || "—",
-        p.code || "—",
-        p.fees,
-        p.total_payment_done,
-        p.pending_amount,
-      ];
+      const cells = [p.patient_id, p.name, p.husband_name || "—", p.date || "—", p.center_name || "—", p.doctor_name || "—", p.code || "—"];
+      if (!hideFinancials) cells.push(p.fees, p.total_payment_done, p.pending_amount);
       lines.push(cells.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(","));
     });
     const blob = new Blob([lines.join("\n")], { type: "text/csv" });
@@ -170,16 +166,20 @@ export default function BookedPatientList() {
                   <th className="p-3">Centre</th>
                   <th className="p-3">Doctor</th>
                   <th className="p-3">Procedure Code</th>
-                  <th className="p-3 text-right">Gross Fees</th>
-                  <th className="p-3 text-right">Received</th>
-                  <th className="p-3 text-right">Pending</th>
+                  {!hideFinancials && (
+                    <>
+                      <th className="p-3 text-right">Gross Fees</th>
+                      <th className="p-3 text-right">Received</th>
+                      <th className="p-3 text-right">Pending</th>
+                    </>
+                  )}
                   <th className="p-3 text-center">Action</th>
                 </tr>
               </thead>
               <tbody>
                 {filteredRows.length === 0 ? (
                   <tr>
-                    <td colSpan={11} className="p-8 text-center text-text-soft">
+                    <td colSpan={hideFinancials ? 8 : 11} className="p-8 text-center text-text-soft">
                       {loading ? "Loading dynamic records..." : "No matching booked patients found in live database."}
                     </td>
                   </tr>
@@ -197,13 +197,17 @@ export default function BookedPatientList() {
                           {p.code || "—"}
                         </span>
                       </td>
-                      <td className="p-3 text-right font-medium">₹ {p.fees.toLocaleString('en-IN')}</td>
-                      <td className="p-3 text-right font-bold text-green-600">
-                        ₹ {p.total_payment_done.toLocaleString('en-IN')}
-                      </td>
-                      <td className={`p-3 text-right font-bold ${p.pending_amount > 0 ? "text-red-500" : "text-green-600"}`}>
-                        ₹ {p.pending_amount.toLocaleString('en-IN')}
-                      </td>
+                      {!hideFinancials && (
+                        <>
+                          <td className="p-3 text-right font-medium">₹ {p.fees.toLocaleString('en-IN')}</td>
+                          <td className="p-3 text-right font-bold text-green-600">
+                            ₹ {p.total_payment_done.toLocaleString('en-IN')}
+                          </td>
+                          <td className={`p-3 text-right font-bold ${p.pending_amount > 0 ? "text-red-500" : "text-green-600"}`}>
+                            ₹ {p.pending_amount.toLocaleString('en-IN')}
+                          </td>
+                        </>
+                      )}
                       <td className="p-3 text-center">
                         <Link
                           href={`/journey?id=${p.patient_id}`}

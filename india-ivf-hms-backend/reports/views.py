@@ -1,9 +1,11 @@
 import json
 import hashlib
+import calendar
+from datetime import date
 from django.shortcuts import render, redirect
 from django.http import JsonResponse
 from django.db import connection
-from django.views.decorators.csrf import csrf_exempt 
+from django.views.decorators.csrf import csrf_exempt
 from django.utils import timezone
 from django.contrib import messages
 
@@ -18,6 +20,7 @@ EMPLOYEE_WORKSPACE_ROLES = {
     'fc': 'counselor',
     'accounts': 'accountant',
     'management': 'viewer',
+    'embryologist': 'embryologist',
 }
 
 
@@ -682,30 +685,69 @@ def get_patient_profile_detail(request):
 @csrf_exempt
 def get_centre_comparison(request):
     center_id = request.GET.get('center_id')
+    from_date = request.GET.get('from')
+    to_date = request.GET.get('to')
     centre_filter_sql = "WHERE c.center_number = %s" if center_id else ""
-    params = [center_id] if center_id else []
+    centre_params = [center_id] if center_id else []
 
-    query = f"""
-        SELECT
-            c.center_number,
-            c.center_name AS CENTRE,
-            COALESCE(SUM(p.totalpackage), 0) AS EXPECTED,
-            COALESCE(SUM(p.payment_done), 0) AS ACTUAL,
-            ROUND(
-                IF(SUM(p.totalpackage) > 0,
-                   (SUM(p.payment_done) / SUM(p.totalpackage)) * 100,
-                   0
-                ), 2
-            ) AS COLLECTION_ADHERENCE_PERCENT,
-            COALESCE(SUM(p.remaining_amount), 0) AS AGING_OUTSTANDING
-        FROM hms_centers c
-        LEFT JOIN hms_patient_procedure p
-            ON p.billing_at = c.center_number
-            AND (p.status IS NULL OR p.status NOT IN ('cancelled', 'disapproved'))
-        {centre_filter_sql}
-        GROUP BY c.center_number, c.center_name
-        ORDER BY c.center_name ASC;
-    """
+    if from_date and to_date:
+        # Period selected: EXPECTED/AGING scope to procedures booked in the window (p.on_date),
+        # ACTUAL scopes to the payment transactions actually received in that same window —
+        # p.payment_done is a running lifetime total, not date-filterable, so we sum the ledger
+        # (hms_patient_payments) directly instead.
+        query = """
+            SELECT
+                c.center_number,
+                c.center_name AS CENTRE,
+                COALESCE(SUM(p.totalpackage), 0) AS EXPECTED,
+                COALESCE(SUM(pay_clean.total_paid), 0) AS ACTUAL,
+                ROUND(
+                    IF(SUM(p.totalpackage) > 0,
+                       (COALESCE(SUM(pay_clean.total_paid), 0) / SUM(p.totalpackage)) * 100,
+                       0
+                    ), 2
+                ) AS COLLECTION_ADHERENCE_PERCENT,
+                COALESCE(SUM(p.remaining_amount), 0) AS AGING_OUTSTANDING
+            FROM hms_centers c
+            LEFT JOIN hms_patient_procedure p
+                ON p.billing_at = c.center_number
+                AND (p.status IS NULL OR p.status NOT IN ('cancelled', 'disapproved'))
+                AND DATE(p.on_date) BETWEEN %s AND %s
+            LEFT JOIN (
+                SELECT billing_id, SUM(payment_done) AS total_paid
+                FROM hms_patient_payments
+                WHERE status IN ('0', '1') AND DATE(on_date) BETWEEN %s AND %s
+                GROUP BY billing_id
+            ) pay_clean ON pay_clean.billing_id = p.receipt_number
+        """ + centre_filter_sql + """
+            GROUP BY c.center_number, c.center_name
+            ORDER BY c.center_name ASC;
+        """
+        params = [from_date, to_date, from_date, to_date] + centre_params
+    else:
+        query = f"""
+            SELECT
+                c.center_number,
+                c.center_name AS CENTRE,
+                COALESCE(SUM(p.totalpackage), 0) AS EXPECTED,
+                COALESCE(SUM(p.payment_done), 0) AS ACTUAL,
+                ROUND(
+                    IF(SUM(p.totalpackage) > 0,
+                       (SUM(p.payment_done) / SUM(p.totalpackage)) * 100,
+                       0
+                    ), 2
+                ) AS COLLECTION_ADHERENCE_PERCENT,
+                COALESCE(SUM(p.remaining_amount), 0) AS AGING_OUTSTANDING
+            FROM hms_centers c
+            LEFT JOIN hms_patient_procedure p
+                ON p.billing_at = c.center_number
+                AND (p.status IS NULL OR p.status NOT IN ('cancelled', 'disapproved'))
+            {centre_filter_sql}
+            GROUP BY c.center_number, c.center_name
+            ORDER BY c.center_name ASC;
+        """
+        params = centre_params
+
     try:
         with connection.cursor() as cursor:
             cursor.execute(query, params)
@@ -731,6 +773,82 @@ def get_centre_comparison(request):
 # ============================================================
 # 7. AGING SNAPSHOT (COMPANY BUCKETS + BY-CENTRE + PATIENT LIST)
 # ============================================================
+
+AGING_FOLLOWUP_STATUSES = [
+    "Active",
+    "Branch Action Required",
+    "On Hold",
+    "Revert to Telecaller team",
+    "Cancellation Request",
+]
+
+
+def ensure_aging_followup_table():
+    with connection.cursor() as cursor:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS reports_agingfollowup (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                invoice VARCHAR(100) NOT NULL,
+                patient_id VARCHAR(50) NOT NULL,
+                status VARCHAR(50) NOT NULL,
+                remarks TEXT,
+                referred_date DATE NULL,
+                history_log LONGTEXT,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                UNIQUE KEY uniq_invoice (invoice)
+            )
+        """)
+
+
+@csrf_exempt
+def save_aging_followup(request):
+    if request.method != 'POST':
+        return JsonResponse({'status': 'error', 'message': 'Use POST.'}, status=405)
+
+    try:
+        data = json.loads(request.body)
+        invoice = str(data.get('invoice') or '').strip()
+        patient_id = str(data.get('patient_id') or '').strip()
+        new_status = str(data.get('status') or '').strip()
+        remarks = str(data.get('remarks') or '').strip()
+
+        if not invoice or not new_status:
+            return JsonResponse({'status': 'error', 'message': 'invoice and status are required.'}, status=400)
+        if new_status not in AGING_FOLLOWUP_STATUSES:
+            return JsonResponse({'status': 'error', 'message': 'Unrecognized status.'}, status=400)
+
+        ensure_aging_followup_table()
+
+        current_now = timezone.now()
+        referred_date = current_now.date() if new_status == 'Revert to Telecaller team' else None
+        log_line = f"[{current_now.strftime('%d-%b-%Y %H:%M')}] {new_status}"
+        if remarks:
+            log_line += f" — {remarks}"
+
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT id, history_log, referred_date FROM reports_agingfollowup WHERE invoice = %s", [invoice])
+            row = cursor.fetchone()
+
+            if row:
+                existing_id, existing_history, existing_referred = row
+                new_history = f"{existing_history}\n{log_line}" if existing_history else log_line
+                final_referred = referred_date or existing_referred
+                cursor.execute("""
+                    UPDATE reports_agingfollowup
+                    SET status = %s, remarks = %s, referred_date = %s, history_log = %s, updated_at = %s
+                    WHERE id = %s
+                """, [new_status, remarks, final_referred, new_history, current_now, existing_id])
+            else:
+                cursor.execute("""
+                    INSERT INTO reports_agingfollowup (invoice, patient_id, status, remarks, referred_date, history_log, created_at, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """, [invoice, patient_id, new_status, remarks, referred_date, log_line, current_now, current_now])
+
+        return JsonResponse({'status': 'success', 'message': 'Follow-up saved.'})
+    except Exception as e:
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+
 
 @csrf_exempt
 def get_aging_snapshot(request):
@@ -772,10 +890,15 @@ def get_aging_snapshot(request):
             DATEDIFF(CURDATE(), p.on_date) AS days_overdue,
             DATE(p.modified_on) AS last_fu,
             p.status AS status,
-            p.receipt_number AS invoice
+            p.receipt_number AS invoice,
+            f.status AS follow_status,
+            f.referred_date AS follow_referred,
+            f.history_log AS follow_history,
+            DATE(f.updated_at) AS follow_updated
         FROM hms_patient_procedure p
         LEFT JOIN hms_appointments a ON a.id = p.appointment_id
         LEFT JOIN hms_centers c ON p.billing_at = c.center_number
+        LEFT JOIN reports_agingfollowup f ON f.invoice = p.receipt_number
         WHERE p.remaining_amount > 0
           AND (p.status IS NULL OR p.status NOT IN ('cancelled', 'disapproved'))
           {patients_filter_sql}
@@ -783,6 +906,7 @@ def get_aging_snapshot(request):
     """
 
     try:
+        ensure_aging_followup_table()
         with connection.cursor() as cursor:
             cursor.execute(by_centre_query, params)
             columns = [col[0] for col in cursor.description]
@@ -855,11 +979,11 @@ def get_aging_snapshot(request):
                 "discPct": disc_pct,
                 "incGst": gross - discount_amount,
                 "daysOverdue": days,
-                "lastFu": iso(r["last_fu"]),
-                "referred": "",
-                "status": r["status"] or "",
+                "lastFu": iso(r["follow_updated"]) or iso(r["last_fu"]),
+                "referred": iso(r["follow_referred"]),
+                "status": r["follow_status"] or r["status"] or "",
                 "invoice": r["invoice"] or "",
-                "history": "",
+                "history": r["follow_history"] or "",
                 "payments": payments_by_receipt.get(r["invoice"], []),
             })
 
@@ -1017,25 +1141,29 @@ def get_red_triggers(request):
     already shown on the /triggers page.
     """
     center_id = request.GET.get('center_id')
-    centre_filter_sql = "AND centre_booking = (SELECT center_name FROM hms_centers WHERE center_number = %s)" if center_id else ""
-    params = [center_id] if center_id else []
+    # centre_booking is mostly a centre name, but a large chunk of rows (e.g. most of
+    # Noida) store the raw center_number as text instead — match either form, and
+    # resolve numeric values back to a display name via hms_centers.
+    centre_filter_sql = "AND (j.centre_booking = (SELECT center_name FROM hms_centers WHERE center_number = %s) OR j.centre_booking = %s)" if center_id else ""
+    params = [center_id, center_id] if center_id else []
 
     query = f"""
         SELECT
-            patient_id,
-            patients_name,
-            centre_booking,
-            DATE(booking_date) AS booking_date,
-            balance_amount,
-            stimulation_start_status,
-            trigger_status,
-            opu_status,
-            DATEDIFF(CURDATE(), booking_date) AS days_since_booking
-        FROM hms_patient_journey
-        WHERE balance_amount > 0
-          AND booking_date IS NOT NULL
+            j.patient_id,
+            j.patients_name,
+            COALESCE(c.center_name, j.centre_booking) AS centre_booking,
+            DATE(j.booking_date) AS booking_date,
+            j.balance_amount,
+            j.stimulation_start_status,
+            j.trigger_status,
+            j.opu_status,
+            DATEDIFF(CURDATE(), j.booking_date) AS days_since_booking
+        FROM hms_patient_journey j
+        LEFT JOIN hms_centers c ON j.centre_booking REGEXP '^[0-9]+$' AND c.center_number = CAST(j.centre_booking AS UNSIGNED)
+        WHERE j.balance_amount > 0
+          AND j.booking_date IS NOT NULL
           {centre_filter_sql}
-        ORDER BY balance_amount DESC;
+        ORDER BY j.balance_amount DESC;
     """
 
     try:
@@ -1073,5 +1201,170 @@ def get_red_triggers(request):
         response["Access-Control-Allow-Headers"] = "*"
         return response
 
+    except Exception as e:
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+
+# ============================================================
+# 10. DASHBOARD SUMMARY (KPIs, CLINICAL STAGE DISTRIBUTION, 7-DAY TREND)
+# ============================================================
+
+DASHBOARD_STAGE_LABELS = ["Booking", "LMP", "Stimulation", "Trigger", "OPU", "Embryology", "Embryo Transfer", "Beta HCG"]
+
+
+def _classify_journey_stage(row):
+    """
+    hms_patient_journey only stores completion status for each milestone
+    (withdrawal, stimulation-start, trigger, OPU, transfer) — there is no
+    explicit "current stage" column, and status entry is sparse/inconsistent:
+    many rows have opu_status='Done' while every earlier field is still blank
+    (entered directly at whatever milestone the branch was updating). A strict
+    front-to-back waterfall would misfile all of those as "just booked", so we
+    instead take the MOST ADVANCED milestone marked done, in the same
+    Stimulation/Trigger/OPU naming convention already used by
+    get_red_triggers (a status field being "Done" means that step is behind
+    them and they're working toward the next one). The two gaps with no
+    status field at all (OPU -> Embryology, Transfer -> Beta HCG) are split
+    with a 1-day-since-milestone heuristic: "today" is the just-finished task,
+    "1+ day later" is the waiting task. LMP has no distinguishing signal in
+    this schema and will stay at 0 until a real field for it exists.
+    """
+    opu_done = row["opu_status"] == "Done"
+    trig_done = row["trigger_status"] == "Done"
+    stim_done = row["stimulation_start_status"] == "Done"
+    withdrawl_done = row["withdrawl_status"] == "Done"
+
+    if opu_done:
+        transfer_date = row["transfer_date"]
+        if not transfer_date:
+            opu_date = row["actual_opu_date"]
+            days = (date.today() - opu_date).days if opu_date else 99
+            return 4 if days <= 1 else 5  # OPU (just done) vs Embryology (culturing)
+        days = (date.today() - transfer_date).days
+        return 6 if days <= 1 else 7  # Embryo Transfer (just done) vs Beta HCG (waiting)
+    if trig_done:
+        return 4  # trigger given, working toward OPU
+    if stim_done:
+        return 3  # stimulating, working toward trigger
+    if withdrawl_done:
+        return 2  # withdrawal done, about to start stimulation
+    return 0  # Booking
+
+
+@csrf_exempt
+def get_dashboard_summary(request):
+    center_id = request.GET.get('center_id')
+    billing_filter_sql = "AND p.billing_at = %s" if center_id else ""
+    billing_params = [center_id] if center_id else []
+    # centre_booking is mostly a centre name, but a large chunk of rows (e.g. most of
+    # Noida) store the raw center_number as text instead — match either form.
+    journey_filter_sql = "AND (centre_booking = (SELECT center_name FROM hms_centers WHERE center_number = %s) OR centre_booking = %s)" if center_id else ""
+    journey_params = [center_id, center_id] if center_id else []
+
+    try:
+        exp_query = f"""
+            SELECT
+                COALESCE(SUM(CASE WHEN DATE(p.on_date) = CURDATE() THEN p.totalpackage ELSE 0 END), 0) AS exp_today,
+                COALESCE(SUM(CASE WHEN YEARWEEK(p.on_date, 1) = YEARWEEK(CURDATE(), 1) THEN p.totalpackage ELSE 0 END), 0) AS exp_week,
+                COALESCE(SUM(CASE WHEN MONTH(p.on_date) = MONTH(CURDATE()) AND YEAR(p.on_date) = YEAR(CURDATE()) THEN p.totalpackage ELSE 0 END), 0) AS exp_month
+            FROM hms_patient_procedure p
+            WHERE (p.status IS NULL OR p.status NOT IN ('cancelled', 'disapproved'))
+              {billing_filter_sql}
+        """
+        with connection.cursor() as cursor:
+            cursor.execute(exp_query, billing_params)
+            exp_today, exp_week, exp_month = cursor.fetchone()
+
+        act_query = f"""
+            SELECT
+                COALESCE(SUM(CASE WHEN DATE(pay.on_date) = CURDATE() THEN pay.payment_done ELSE 0 END), 0) AS act_today,
+                COALESCE(SUM(CASE WHEN YEARWEEK(pay.on_date, 1) = YEARWEEK(CURDATE(), 1) THEN pay.payment_done ELSE 0 END), 0) AS act_week,
+                COALESCE(SUM(CASE WHEN MONTH(pay.on_date) = MONTH(CURDATE()) AND YEAR(pay.on_date) = YEAR(CURDATE()) THEN pay.payment_done ELSE 0 END), 0) AS act_month
+            FROM hms_patient_payments pay
+            INNER JOIN hms_patient_procedure p ON p.receipt_number = pay.billing_id
+            WHERE pay.status IN ('0', '1')
+              {billing_filter_sql}
+        """
+        with connection.cursor() as cursor:
+            cursor.execute(act_query, billing_params)
+            act_today, act_week, act_month = cursor.fetchone()
+
+        trend_query = f"""
+            SELECT DATE(pay.on_date) AS d, COALESCE(SUM(pay.payment_done), 0) AS amt
+            FROM hms_patient_payments pay
+            INNER JOIN hms_patient_procedure p ON p.receipt_number = pay.billing_id
+            WHERE pay.status IN ('0', '1')
+              AND pay.on_date >= DATE_SUB(CURDATE(), INTERVAL 6 DAY)
+              {billing_filter_sql}
+            GROUP BY DATE(pay.on_date)
+            ORDER BY d ASC
+        """
+        with connection.cursor() as cursor:
+            cursor.execute(trend_query, billing_params)
+            trend_by_day = {row[0].isoformat(): float(row[1] or 0) for row in cursor.fetchall()}
+        week_trend = []
+        for i in range(6, -1, -1):
+            d = date.today() - timezone.timedelta(days=i)
+            week_trend.append(trend_by_day.get(d.isoformat(), 0.0))
+
+        triggers_count_query = f"""
+            SELECT COUNT(*) FROM hms_patient_journey
+            WHERE balance_amount > 0 AND booking_date IS NOT NULL
+            {journey_filter_sql}
+        """
+        with connection.cursor() as cursor:
+            cursor.execute(triggers_count_query, journey_params)
+            red_triggers = cursor.fetchone()[0]
+
+        ensure_aging_followup_table()
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) FROM reports_agingfollowup WHERE status = %s", ['Cancellation Request'])
+            approvals_pending = cursor.fetchone()[0]
+
+        stage_query = f"""
+            SELECT COALESCE(c.center_name, j.centre_booking) AS centre_booking,
+                   j.withdrawl_status, j.stimulation_start_status, j.trigger_status, j.opu_status,
+                   j.actual_opu_date, j.transfer_date
+            FROM hms_patient_journey j
+            LEFT JOIN hms_centers c ON j.centre_booking REGEXP '^[0-9]+$' AND c.center_number = CAST(j.centre_booking AS UNSIGNED)
+            WHERE j.booking_date IS NOT NULL
+              {journey_filter_sql}
+        """
+        with connection.cursor() as cursor:
+            cursor.execute(stage_query, journey_params)
+            columns = [col[0] for col in cursor.description]
+            journey_rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+        stage_counts = [0] * 8
+        centre_stage_counts = {}
+        for row in journey_rows:
+            idx = _classify_journey_stage(row)
+            stage_counts[idx] += 1
+            centre = row["centre_booking"] or "Unassigned"
+            centre_stage_counts.setdefault(centre, [0] * 8)
+            centre_stage_counts[centre][idx] += 1
+
+        stage_by_centre = [
+            {"centre": centre, "counts": counts, "total": sum(counts)}
+            for centre, counts in sorted(centre_stage_counts.items())
+        ]
+
+        today = date.today()
+        days_in_week = today.isoweekday()
+        days_in_month = today.day
+        total_days_in_month = calendar.monthrange(today.year, today.month)[1]
+        week_projection = (float(act_week) / days_in_week * 7) if days_in_week else float(act_week)
+        month_projection = (float(act_month) / days_in_month * total_days_in_month) if days_in_month else float(act_month)
+
+        return JsonResponse({
+            "kpi": {
+                "today": {"exp": float(exp_today), "act": float(act_today), "redTriggers": red_triggers, "approvalsPending": approvals_pending},
+                "week": {"exp": float(exp_week), "act": float(act_week), "projection": week_projection, "redTriggers": red_triggers},
+                "month": {"exp": float(exp_month), "act": float(act_month), "projection": month_projection, "redTriggers": red_triggers},
+            },
+            "stageLabels": DASHBOARD_STAGE_LABELS,
+            "stageCounts": stage_counts,
+            "stageByCentre": stage_by_centre,
+            "weekTrend": week_trend,
+        })
     except Exception as e:
         return JsonResponse({'status': 'error', 'message': str(e)}, status=500)

@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { fmtINR } from "@/lib/format";
+import { fmtINR, localISODate, TODAY } from "@/lib/format";
 import { getClientScopedCenterId } from "@/lib/clientSession";
 import { BarTrack, Card, PageHead, TableWrap } from "@/components/ui";
 
@@ -14,45 +14,64 @@ interface CentreRow {
   AGING_OUTSTANDING: number;
 }
 
+function periodRange(range: string, customFrom: string, customTo: string): { from: string; to: string } | null {
+  const today = new Date(TODAY + "T00:00:00");
+  const iso = localISODate;
+
+  if (range === "today") return { from: TODAY, to: TODAY };
+  if (range === "week") {
+    const dow = today.getDay();
+    const off = (dow + 6) % 7;
+    const mon = new Date(today);
+    mon.setDate(today.getDate() - off);
+    const sun = new Date(mon);
+    sun.setDate(mon.getDate() + 6);
+    return { from: iso(mon), to: iso(sun) };
+  }
+  if (range === "month") {
+    const first = new Date(today.getFullYear(), today.getMonth(), 1);
+    const last = new Date(today.getFullYear(), today.getMonth() + 1, 0);
+    return { from: iso(first), to: iso(last) };
+  }
+  if (range === "custom") {
+    if (!customFrom || !customTo) return null;
+    return { from: customFrom, to: customTo };
+  }
+  return null; // "all"
+}
+
 export default function CentreComparisonLive() {
   const [centres, setCentres] = useState<CentreRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [range, setRange] = useState("all");
+  const [customFrom, setCustomFrom] = useState(TODAY);
+  const [customTo, setCustomTo] = useState(TODAY);
 
   const fetchCentreStats = async () => {
     try {
       setLoading(true);
       setError("");
 
-      // Try multiple host fallbacks to bypass localhost/127.0.0.1 origin blocks
       const centerId = getClientScopedCenterId();
-      const qs = centerId ? `?center_id=${centerId}` : "";
-      const apiUrls = [
-        `http://127.0.0.1:8000/api/get_centre_comparison/${qs}`,
-        `http://localhost:8000/api/get_centre_comparison/${qs}`,
-      ];
-
-      let response: Response | null = null;
-      for (const url of apiUrls) {
-        try {
-          const res = await fetch(url, {
-            method: "GET",
-            headers: {
-              "Content-Type": "application/json",
-            },
-            cache: "no-store",
-          });
-          if (res.ok) {
-            response = res;
-            break;
-          }
-        } catch (e) {
-          // Continue to next URL fallback if one fails
-        }
+      const period = periodRange(range, customFrom, customTo);
+      const params = new URLSearchParams();
+      if (centerId) params.set("center_id", String(centerId));
+      if (period) {
+        params.set("from", period.from);
+        params.set("to", period.to);
       }
+      const qs = params.toString() ? `?${params.toString()}` : "";
+      const response = await fetch(`/api/centre-comparison${qs}`, {
+        method: "GET",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        cache: "no-store",
+      });
 
-      if (!response) {
-        throw new Error("Unable to connect to Django API on 127.0.0.1 or localhost.");
+      if (!response.ok) {
+        throw new Error(`HTTP Error: ${response.status}`);
       }
 
       const data = await response.json();
@@ -67,7 +86,7 @@ export default function CentreComparisonLive() {
 
   useEffect(() => {
     fetchCentreStats();
-  }, []);
+  }, [range, customFrom, customTo]);
 
   // CSV Export Handler
   function exportCsv() {
@@ -82,25 +101,56 @@ export default function CentreComparisonLive() {
     const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8;" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
-    a.download = `centre-comparison-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.download = `centre-comparison-${localISODate()}.csv`;
     document.body.appendChild(a);
     a.click();
     a.remove();
   }
 
-  // Calculated Metrics
-  const ranked = centres.slice().sort((a, b) => b.COLLECTION_ADHERENCE_PERCENT - a.COLLECTION_ADHERENCE_PERCENT);
+  const RANGE_LABELS: Record<string, string> = { all: "all time", today: "today", week: "this week", month: "this month", custom: "custom range" };
+
+  // Calculated Metrics — hide centres with no activity at all (no expected/actual/outstanding)
+  const activeCentres = centres.filter((c) => c.EXPECTED !== 0 || c.ACTUAL !== 0 || c.AGING_OUTSTANDING !== 0);
+  const ranked = activeCentres.slice().sort((a, b) => b.COLLECTION_ADHERENCE_PERCENT - a.COLLECTION_ADHERENCE_PERCENT);
   const best = ranked[0];
   const worst = ranked[ranked.length - 1];
-  const highestAging = centres.length ? centres.slice().sort((a, b) => b.AGING_OUTSTANDING - a.AGING_OUTSTANDING)[0] : null;
+  const highestAging = activeCentres.length ? activeCentres.slice().sort((a, b) => b.AGING_OUTSTANDING - a.AGING_OUTSTANDING)[0] : null;
 
   return (
     <section className="screen-enter space-y-6">
       <PageHead
         title="Centre Comparison"
-        sub="Collection adherence ranked across all centres"
+        sub={`Collection adherence ranked across all centres · ${RANGE_LABELS[range]}`}
         actions={
           <>
+            <select
+              value={range}
+              onChange={(e) => setRange(e.target.value)}
+              className="rounded-[8px] border border-border bg-surface px-2.5 py-1.5 text-[11.5px]"
+            >
+              <option value="all">All time</option>
+              <option value="today">Today</option>
+              <option value="week">This week</option>
+              <option value="month">This month</option>
+              <option value="custom">Custom range</option>
+            </select>
+            {range === "custom" && (
+              <span className="flex items-center gap-1.5 text-[11.5px] text-text-soft">
+                <input
+                  type="date"
+                  value={customFrom}
+                  onChange={(e) => setCustomFrom(e.target.value)}
+                  className="rounded-[8px] border border-border bg-surface px-2 py-1.5 text-[11.5px]"
+                />
+                <span>to</span>
+                <input
+                  type="date"
+                  value={customTo}
+                  onChange={(e) => setCustomTo(e.target.value)}
+                  className="rounded-[8px] border border-border bg-surface px-2 py-1.5 text-[11.5px]"
+                />
+              </span>
+            )}
             <span className="rounded-full bg-green-soft px-2.5 py-1 text-[10px] font-bold uppercase tracking-wide text-green">
               ● Live Data
             </span>
@@ -181,7 +231,7 @@ export default function CentreComparisonLive() {
           <Card title="Needs Attention">
             <div className="font-display text-[21px] text-red">{worst.CENTRE}</div>
             <div className="mt-1.5 text-[12px] text-text-soft">
-              {worst.COLLECTION_ADHERENCE_PERCENT}% adherence — lowest of {centres.length} centres
+              {worst.COLLECTION_ADHERENCE_PERCENT}% adherence — lowest of {activeCentres.length} centres
             </div>
           </Card>
           <Card title="Highest Aging Outstanding">

@@ -1,16 +1,33 @@
-import { getCentreStats, getDashboard, getOverrides, getPrebook } from "@/lib/api";
-import { fmtINR } from "@/lib/format";
+import { getCentreComparison, getDashboardSummary, getOverrides, getPrebook } from "@/lib/api";
+import { getScopedCenterId } from "@/lib/auth";
+import { fmtINR, TODAY } from "@/lib/format";
 import { Card, Hbar, PageHead, Pill, Sparkline, TableWrap } from "@/components/ui";
 import KpiSubtabs from "@/components/dashboard/KpiSubtabs";
 import PrebookFunnel from "@/components/dashboard/PrebookFunnel";
 import StageWidget from "@/components/StageWidget";
 
 export default async function DashboardPage() {
-  const [dash, prebook, centreStats, overrides] = await Promise.all([getDashboard(), getPrebook(), getCentreStats(), getOverrides()]);
-  const { centres, weekTrend } = centreStats;
+  const centerId = await getScopedCenterId();
+  const [summary, prebook, centreRows, overrides] = await Promise.all([
+    getDashboardSummary(centerId),
+    getPrebook(centerId),
+    getCentreComparison(centerId),
+    getOverrides(),
+  ]);
+
+  const centres = centreRows
+    .filter((r) => r.EXPECTED !== 0 || r.ACTUAL !== 0 || r.AGING_OUTSTANDING !== 0)
+    .map((r) => ({ centre: r.CENTRE, exp: r.EXPECTED, act: r.ACTUAL, adh: r.COLLECTION_ADHERENCE_PERCENT }))
+    .sort((a, b) => b.adh - a.adh);
+  const { weekTrend } = summary;
 
   const bestDayIdx = weekTrend.indexOf(Math.max(...weekTrend));
-  const dayNames = ["Sat", "Sun", "Mon", "Tue", "Wed", "Thu", "Fri"];
+  // weekTrend[6] is today, weekTrend[0] is 6 days ago — derive each day's label from the real date.
+  const dayNames = Array.from({ length: 7 }, (_, i) => {
+    const d = new Date(TODAY + "T00:00:00");
+    d.setDate(d.getDate() - (6 - i));
+    return d.toLocaleDateString("en-US", { weekday: "short" });
+  });
   const avg = Math.round(weekTrend.reduce((s, v) => s + v, 0) / weekTrend.length);
 
   return (
@@ -35,7 +52,7 @@ export default async function DashboardPage() {
         </div>
       </div>
 
-      <KpiSubtabs kpi={dash.kpi} />
+      <KpiSubtabs kpi={summary.kpi} />
 
       <PrebookFunnel prebook={prebook} />
 
@@ -47,7 +64,7 @@ export default async function DashboardPage() {
         }
         tools={<span className="rounded-full bg-green-soft px-2.5 py-1 text-[10px] font-bold uppercase tracking-wide text-green">Live data</span>}
       >
-        <StageWidget />
+        <StageWidget stageLabels={summary.stageLabels} stageCounts={summary.stageCounts} stageByCentre={summary.stageByCentre} />
       </Card>
 
       <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
@@ -69,7 +86,7 @@ export default async function DashboardPage() {
             <div className="flex justify-between">
               <span className="text-text-soft">Today&apos;s collection</span>
               <span>
-                <b>{fmtINR(weekTrend[weekTrend.length - 1])}</b> across 6 centres
+                <b>{fmtINR(weekTrend[weekTrend.length - 1])}</b> across {centres.length} centres
               </span>
             </div>
             <div className="flex justify-between">

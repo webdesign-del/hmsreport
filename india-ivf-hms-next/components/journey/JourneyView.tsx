@@ -1,6 +1,8 @@
 "use client";
 
 import { useState, useEffect } from "react";
+import { getClientSession, hidesFinancials } from "@/lib/clientSession";
+import { localISODate } from "@/lib/format";
 
 interface JourneyViewProps {
   initialId?: string;
@@ -26,6 +28,15 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
   const [donors, setDonors] = useState<any[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [hideFinancials, setHideFinancials] = useState(false);
+  const [hideClinicalForms, setHideClinicalForms] = useState(false);
+
+  useEffect(() => {
+    const role = getClientSession()?.role;
+    setHideFinancials(hidesFinancials(role));
+    // Embryologists work the lab side (Embryology Forms) — clinical/daycare forms aren't theirs.
+    setHideClinicalForms(role === "embryologist");
+  }, []);
 
   // Track image load error states locally
   const [wifeImgError, setWifeImgError] = useState(false);
@@ -38,8 +49,8 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
   // 📅 DATE CHANGE INLINE POPOVER STATE
   const [editingStageIdx, setEditingStageIdx] = useState<number | null>(null);
   const [dateChangeForm, setDateChangeForm] = useState({
-    fromDate: new Date().toISOString().split("T")[0],
-    toDate: new Date().toISOString().split("T")[0],
+    fromDate: localISODate(),
+    toDate: localISODate(),
     reason: "",
   });
 
@@ -68,7 +79,7 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
       setHusbandImgError(false);
 
       const res = await fetch(
-        `http://127.0.0.1:8000/api/get_patient_profile_detail/?receipt_number=${encodeURIComponent(idToFetch.trim())}`,
+        `/api/patient-profile?receipt_number=${encodeURIComponent(idToFetch.trim())}`,
         { cache: "no-store" }
       );
 
@@ -145,7 +156,7 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
       }
     } catch (err: any) {
       console.error("Journey API Error:", err);
-      setError("Unable to connect to Django API server at http://127.0.0.1:8000");
+      setError("Unable to connect to the backend server.");
     } finally {
       setLoading(false);
     }
@@ -168,7 +179,7 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
 
   const handleOpenDateChange = (idx: number) => {
     setEditingStageIdx(idx);
-    const today = new Date().toISOString().split("T")[0];
+    const today = localISODate();
     setDateChangeForm({ fromDate: today, toDate: today, reason: "" });
   };
 
@@ -299,24 +310,28 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
                   {patientProfile.patient_phone || patientProfile.wife_phone || "—"}
                 </strong>
               </div>
-              <div>
-                <span className="text-text-soft block text-[11px]">Gross Billed</span>
-                <strong className="text-slate-800 text-sm">
-                  ₹ {patientProfile.fees ? patientProfile.fees.toLocaleString("en-IN") : "0"}
-                </strong>
-              </div>
-              <div>
-                <span className="text-text-soft block text-[11px]">Amount Received</span>
-                <strong className="text-green-600 text-sm">
-                  ₹ {patientProfile.payment_done ? patientProfile.payment_done.toLocaleString("en-IN") : "0"}
-                </strong>
-              </div>
-              <div>
-                <span className="text-text-soft block text-[11px]">Pending Balance</span>
-                <strong className={`text-sm ${patientProfile.pending > 0 ? "text-red-500" : "text-green-600"}`}>
-                  ₹ {patientProfile.pending ? patientProfile.pending.toLocaleString("en-IN") : "0"}
-                </strong>
-              </div>
+              {!hideFinancials && (
+                <>
+                  <div>
+                    <span className="text-text-soft block text-[11px]">Gross Billed</span>
+                    <strong className="text-slate-800 text-sm">
+                      ₹ {patientProfile.fees ? patientProfile.fees.toLocaleString("en-IN") : "0"}
+                    </strong>
+                  </div>
+                  <div>
+                    <span className="text-text-soft block text-[11px]">Amount Received</span>
+                    <strong className="text-green-600 text-sm">
+                      ₹ {patientProfile.payment_done ? patientProfile.payment_done.toLocaleString("en-IN") : "0"}
+                    </strong>
+                  </div>
+                  <div>
+                    <span className="text-text-soft block text-[11px]">Pending Balance</span>
+                    <strong className={`text-sm ${patientProfile.pending > 0 ? "text-red-500" : "text-green-600"}`}>
+                      ₹ {patientProfile.pending ? patientProfile.pending.toLocaleString("en-IN") : "0"}
+                    </strong>
+                  </div>
+                </>
+              )}
             </div>
           </div>
         </div>
@@ -337,12 +352,16 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
                 <tr>
                   <th className="p-3">Date</th>
                   <th className="p-3">Category</th>
-                  <th className="p-3">Code (Click to View Partial Payments)</th>
+                  <th className="p-3">{hideFinancials ? "Code" : "Code (Click to View Partial Payments)"}</th>
                   <th className="p-3">Procedure Name</th>
                   <th className="p-3">Receipt No</th>
-                  <th className="p-3 text-right">Fees</th>
-                  <th className="p-3 text-right">Received</th>
-                  <th className="p-3 text-right">Pending</th>
+                  {!hideFinancials && (
+                    <>
+                      <th className="p-3 text-right">Fees</th>
+                      <th className="p-3 text-right">Received</th>
+                      <th className="p-3 text-right">Pending</th>
+                    </>
+                  )}
                 </tr>
               </thead>
               <tbody>
@@ -355,39 +374,50 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
                       </span>
                     </td>
                     <td className="p-3">
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setActivePaymentModal({
-                            procedureName: proc.procedure_name,
-                            code: proc.code || "PROC",
-                            receiptNo: proc.receipt_number,
-                            fees: proc.fees,
-                            paymentDone: proc.payment_done,
-                            pending: proc.pending,
-                            breakups: proc.payment_breakups || [],
-                          })
-                        }
-                        className="bg-amber-100 text-amber-900 hover:bg-amber-200 px-2.5 py-1 rounded-md font-bold transition shadow-sm border border-amber-300 inline-flex items-center gap-1 cursor-pointer"
-                        title="Click to view partial payment breakups"
-                      >
-                        <span>🏷️</span>
-                        <span>{proc.code || "IP288"}</span>
-                      </button>
+                      {hideFinancials ? (
+                        <span className="bg-amber-100 text-amber-900 px-2.5 py-1 rounded-md font-bold inline-flex items-center gap-1 border border-amber-300">
+                          <span>🏷️</span>
+                          <span>{proc.code || "IP288"}</span>
+                        </span>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setActivePaymentModal({
+                              procedureName: proc.procedure_name,
+                              code: proc.code || "PROC",
+                              receiptNo: proc.receipt_number,
+                              fees: proc.fees,
+                              paymentDone: proc.payment_done,
+                              pending: proc.pending,
+                              breakups: proc.payment_breakups || [],
+                            })
+                          }
+                          className="bg-amber-100 text-amber-900 hover:bg-amber-200 px-2.5 py-1 rounded-md font-bold transition shadow-sm border border-amber-300 inline-flex items-center gap-1 cursor-pointer"
+                          title="Click to view partial payment breakups"
+                        >
+                          <span>🏷️</span>
+                          <span>{proc.code || "IP288"}</span>
+                        </button>
+                      )}
                     </td>
                     <td className="p-3 font-bold text-text-dark">{proc.procedure_name || "—"}</td>
                     <td className="p-3 text-text-soft">{proc.receipt_number || "—"}</td>
-                    <td className="p-3 text-right font-medium">₹ {proc.fees?.toLocaleString("en-IN")}</td>
-                    <td className="p-3 text-right font-bold text-green-600">
-                      ₹ {proc.payment_done?.toLocaleString("en-IN")}
-                    </td>
-                    <td
-                      className={`p-3 text-right font-bold ${
-                        proc.pending > 0 ? "text-red-500" : "text-green-600"
-                      }`}
-                    >
-                      ₹ {proc.pending?.toLocaleString("en-IN")}
-                    </td>
+                    {!hideFinancials && (
+                      <>
+                        <td className="p-3 text-right font-medium">₹ {proc.fees?.toLocaleString("en-IN")}</td>
+                        <td className="p-3 text-right font-bold text-green-600">
+                          ₹ {proc.payment_done?.toLocaleString("en-IN")}
+                        </td>
+                        <td
+                          className={`p-3 text-right font-bold ${
+                            proc.pending > 0 ? "text-red-500" : "text-green-600"
+                          }`}
+                        >
+                          ₹ {proc.pending?.toLocaleString("en-IN")}
+                        </td>
+                      </>
+                    )}
                   </tr>
                 ))}
               </tbody>
@@ -405,9 +435,9 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
           {[
             { key: "comm", label: "Communication" },
             { key: "plan", label: "Change in Plan" },
-            { key: "clinical_forms", label: "Clinical Forms" },
+            ...(hideClinicalForms ? [] : [{ key: "clinical_forms", label: "Clinical Forms" }]),
             { key: "embryo_forms", label: "Embryology Forms" },
-            { key: "financial", label: "Financials" },
+            ...(hideFinancials ? [] : [{ key: "financial", label: "Financials" }]),
             { key: "compliances", label: "Compliances" },
           ].map((t) => {
             const active = !hiddenTracks.has(t.key);
@@ -459,7 +489,7 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
                   <th className="p-3.5">Linked Procedure</th>
                   
                   {/* 🔵 CLINICAL FORMS COLUMN HEADER */}
-                  {!hiddenTracks.has("clinical_forms") && (
+                  {!hideClinicalForms && !hiddenTracks.has("clinical_forms") && (
                     <th className="p-3.5 text-blue-700 bg-blue-50/50">
                       Clinical Forms
                       <span className="block text-[9px] font-normal text-blue-500 lowercase">daycare_procedure</span>
@@ -474,7 +504,7 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
                     </th>
                   )}
 
-                  {!hiddenTracks.has("financial") && <th className="p-3.5 text-right">Financials</th>}
+                  {!hideFinancials && !hiddenTracks.has("financial") && <th className="p-3.5 text-right">Financials</th>}
                   {!hiddenTracks.has("compliances") && <th className="p-3.5 text-center">Compliances</th>}
                 </tr>
               </thead>
@@ -738,7 +768,7 @@ return (
 </td>
 
                       {/* 🔵 6. CLINICAL FORMS (daycare_procedure) */}
-                      {!hiddenTracks.has("clinical_forms") && (
+                      {!hideClinicalForms && !hiddenTracks.has("clinical_forms") && (
                         <td className="p-3.5 bg-blue-50/20">
                           {clinicalForms.length > 0 ? (
                             <div className="flex flex-wrap gap-1.5">
@@ -806,7 +836,7 @@ return (
                       )}
 
                       {/* 8. Financials */}
-                      {!hiddenTracks.has("financial") && (
+                      {!hideFinancials && !hiddenTracks.has("financial") && (
                         <td className="p-3.5 text-right">
                           <div className="font-bold text-text">
                             ₹ {(linkedProc.fees || patientProfile.fees / stages.length).toLocaleString("en-IN")}

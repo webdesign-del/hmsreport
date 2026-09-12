@@ -10,6 +10,7 @@ const BUCKET_TONE = ["border-t-green", "border-t-blue", "border-t-amber", "borde
 export default async function AgingPage() {
   const centerId = await getScopedCenterId();
   const { companyBuckets, bucketCounts, byCentre, patients: agingPatients } = await getAgingSnapshot(centerId);
+  const activeByCentre = byCentre.filter((c) => c.total !== 0);
 
   return (
     <section className="screen-enter">
@@ -46,7 +47,7 @@ export default async function AgingPage() {
               </tr>
             </thead>
             <tbody>
-              {byCentre.map((c) => (
+              {activeByCentre.map((c) => (
                 <tr key={c.centre}>
                   <td className="strong">{c.centre}</td>
                   {c.buckets.map((v, i) => (

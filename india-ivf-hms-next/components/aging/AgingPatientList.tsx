@@ -9,6 +9,8 @@ import type { AgingPatient } from "@/lib/types";
 
 const BUCKET_LABELS = ["0–30 d", "31–60 d", "61–90 d", "91–180 d", "180+ d"];
 
+const FOLLOWUP_STATUSES = ["Active", "Branch Action Required", "On Hold", "Revert to Telecaller team", "Cancellation Request"] as const;
+
 function inDateRange(iso: string, range: string, single: string, from: string, to: string): boolean {
   if (range === "all" || !iso) return true;
   const T = new Date(TODAY + "T00:00:00");
@@ -34,6 +36,7 @@ function inDateRange(iso: string, range: string, single: string, from: string, t
 }
 
 export default function AgingPatientList({ patients }: { patients: AgingPatient[] }) {
+  const [localPatients, setLocalPatients] = useState<AgingPatient[]>(patients);
   const [bucket, setBucket] = useState<number | null>(null);
   const [search, setSearch] = useState("");
   const [range, setRange] = useState("all");
@@ -43,16 +46,77 @@ export default function AgingPatientList({ patients }: { patients: AgingPatient[
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(50);
 
-  const bucketCounts = useMemo(() => [0, 1, 2, 3, 4].map((i) => patients.filter((p) => bucketIdx(p.daysOverdue) === i).length), [patients]);
+  const [followUpTarget, setFollowUpTarget] = useState<AgingPatient | null>(null);
+  const [followUpStatus, setFollowUpStatus] = useState<string>(FOLLOWUP_STATUSES[0]);
+  const [followUpRemarks, setFollowUpRemarks] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState("");
+
+  useEffect(() => {
+    setLocalPatients(patients);
+  }, [patients]);
+
+  function openFollowUp(p: AgingPatient) {
+    setFollowUpTarget(p);
+    setFollowUpStatus((FOLLOWUP_STATUSES as readonly string[]).includes(p.status) ? p.status : FOLLOWUP_STATUSES[0]);
+    setFollowUpRemarks("");
+    setSaveError("");
+  }
+
+  async function submitFollowUp() {
+    if (!followUpTarget) return;
+    setSaving(true);
+    setSaveError("");
+    try {
+      const res = await fetch("/api/aging-followup", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          invoice: followUpTarget.invoice,
+          patient_id: followUpTarget.id,
+          status: followUpStatus,
+          remarks: followUpRemarks.trim(),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.status !== "success") throw new Error(data.message || "Failed to save follow-up.");
+
+      const now = new Date();
+      const stamp = now.toLocaleString("en-IN", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" });
+      let logLine = `[${stamp}] ${followUpStatus}`;
+      if (followUpRemarks.trim()) logLine += ` — ${followUpRemarks.trim()}`;
+
+      setLocalPatients((list) =>
+        list.map((p) =>
+          p.invoice === followUpTarget.invoice
+            ? {
+                ...p,
+                status: followUpStatus,
+                lastFu: TODAY,
+                referred: followUpStatus === "Revert to Telecaller team" ? TODAY : p.referred,
+                history: p.history ? `${p.history}\n${logLine}` : logLine,
+              }
+            : p
+        )
+      );
+      setFollowUpTarget(null);
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : "Failed to save follow-up.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const bucketCounts = useMemo(() => [0, 1, 2, 3, 4].map((i) => localPatients.filter((p) => bucketIdx(p.daysOverdue) === i).length), [localPatients]);
 
   const filtered = useMemo(() => {
-    let list = patients.slice();
+    let list = localPatients.slice();
     if (bucket !== null) list = list.filter((p) => bucketIdx(p.daysOverdue) === bucket);
     list = list.filter((p) => inDateRange(p.lastFu, range, single, from, to));
     const q = search.trim().toLowerCase();
     if (q) list = list.filter((p) => p.name.toLowerCase().includes(q) || p.id.toLowerCase().includes(q));
     return list;
-  }, [patients, bucket, range, single, from, to, search]);
+  }, [localPatients, bucket, range, single, from, to, search]);
 
   useEffect(() => {
     setPage(1);
@@ -107,7 +171,7 @@ export default function AgingPatientList({ patients }: { patients: AgingPatient[
             onClick={() => setBucket(null)}
             className={`rounded-full border px-3 py-1.5 text-[11.5px] font-semibold transition-colors ${bucket === null ? "border-primary bg-primary-soft text-primary-dark" : "border-border text-text-mid hover:border-primary"}`}
           >
-            All <span className="ml-1 text-text-soft">{patients.length}</span>
+            All <span className="ml-1 text-text-soft">{localPatients.length}</span>
           </button>
           {BUCKET_LABELS.map((l, i) => (
             <button
@@ -218,7 +282,11 @@ export default function AgingPatientList({ patients }: { patients: AgingPatient[
                   <td>{fmtDate(p.lastFu)}</td>
                   <td className="max-w-[240px] whitespace-normal">{p.history}</td>
                   <td>
-                    <button type="button" className="rounded-[8px] bg-primary px-2.5 py-1 text-[11px] font-semibold text-white">
+                    <button
+                      type="button"
+                      onClick={() => openFollowUp(p)}
+                      className="rounded-[8px] bg-primary px-2.5 py-1 text-[11px] font-semibold text-white transition-colors hover:bg-primary-dark"
+                    >
                       Follow-up
                     </button>
                   </td>
@@ -283,6 +351,66 @@ export default function AgingPatientList({ patients }: { patients: AgingPatient[
           </button>
         </div>
       </div>
+
+      {followUpTarget && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/40 p-4" onClick={() => !saving && setFollowUpTarget(null)}>
+          <div className="w-full max-w-md rounded-[14px] bg-surface p-5 shadow-xl" onClick={(e) => e.stopPropagation()}>
+            <div className="mb-1 text-sm font-semibold text-primary-dark">Follow-up · {followUpTarget.name}</div>
+            <div className="mb-4 text-[11.5px] text-text-soft">
+              {followUpTarget.id} · Invoice {followUpTarget.invoice || "—"}
+            </div>
+
+            <label className="mb-1 block text-[11.5px] font-semibold text-text-mid">Current Status</label>
+            <select
+              value={followUpStatus}
+              onChange={(e) => setFollowUpStatus(e.target.value)}
+              className="mb-3 w-full rounded-[8px] border border-border bg-surface px-3 py-2 text-[12.5px] outline-none focus:border-primary"
+            >
+              {FOLLOWUP_STATUSES.map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+            </select>
+
+            <label className="mb-1 block text-[11.5px] font-semibold text-text-mid">Remarks</label>
+            <textarea
+              value={followUpRemarks}
+              onChange={(e) => setFollowUpRemarks(e.target.value)}
+              rows={3}
+              placeholder="Add context — call logs, patient request, reason for status…"
+              className="mb-3 w-full resize-none rounded-[8px] border border-border bg-surface px-3 py-2 text-[12.5px] outline-none focus:border-primary"
+            />
+
+            {followUpTarget.history && (
+              <div className="mb-3 max-h-28 overflow-y-auto rounded-[8px] bg-surface-2 p-2.5 text-[11px] leading-relaxed text-text-soft whitespace-pre-line">
+                {followUpTarget.history}
+              </div>
+            )}
+
+            {saveError && <div className="mb-3 rounded-[8px] bg-red-soft px-3 py-2 text-[11.5px] font-semibold text-red">{saveError}</div>}
+
+            <div className="flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setFollowUpTarget(null)}
+                disabled={saving}
+                className="rounded-[8px] border border-border px-3 py-1.5 text-[12px] font-semibold text-text-mid hover:border-primary disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={submitFollowUp}
+                disabled={saving}
+                className="rounded-[8px] bg-primary px-3.5 py-1.5 text-[12px] font-semibold text-white transition-colors hover:bg-primary-dark disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {saving ? "Saving…" : "Save Follow-up"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -4,6 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
 import { isNavGroup, MGMT_NAV } from "./nav";
+import { getClientSession } from "@/lib/clientSession";
 
 function LinkRow({ href, label, ic, active, sub, collapsed }: { href: string; label: string; ic: string; active: boolean; sub?: boolean; collapsed?: boolean }) {
   return (
@@ -34,6 +35,7 @@ export default function Sidebar() {
   const pathname = usePathname();
   const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>({});
   const [collapsed, setCollapsed] = useState(false);
+  const [role, setRole] = useState<string | null>(null);
 
   useEffect(() => {
     try {
@@ -42,7 +44,10 @@ export default function Sidebar() {
     } catch {
       // ignore
     }
+    setRole(getClientSession()?.role ?? null);
   }, []);
+
+  const visibleNav = MGMT_NAV.filter((n) => !role || !n.hideForRoles?.includes(role));
 
   function toggleCollapsed() {
     setCollapsed((c) => {
@@ -78,7 +83,7 @@ export default function Sidebar() {
         </div>
       )}
 
-      {MGMT_NAV.map((n) => {
+      {visibleNav.map((n) => {
         if (isNavGroup(n)) {
           const groupCollapsed = collapsed || collapsedGroups[n.group];
           const anyActive = n.children.some((c) => pathname.startsWith(c.href));

@@ -1,0 +1,21 @@
+import { NextResponse } from "next/server";
+
+const DJANGO_URLS = [
+  "http://127.0.0.1:8000/api/get_patient_profile_detail/",
+  "http://localhost:8000/api/get_patient_profile_detail/",
+];
+
+export async function GET(request: Request) {
+  const receiptNumber = new URL(request.url).searchParams.get("receipt_number");
+  const qs = receiptNumber ? `?receipt_number=${encodeURIComponent(receiptNumber)}` : "";
+
+  for (const url of DJANGO_URLS) {
+    try {
+      const res = await fetch(`${url}${qs}`, { cache: "no-store" });
+      if (res.ok) return NextResponse.json(await res.json());
+    } catch {
+      // try next fallback host
+    }
+  }
+  return NextResponse.json({ error: "Django API unreachable on 127.0.0.1 or localhost." }, { status: 502 });
+}

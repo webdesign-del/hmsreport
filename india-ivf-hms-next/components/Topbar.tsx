@@ -4,11 +4,16 @@ import { useEffect, useState } from "react";
 import Image from "next/image";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
+import { getCentreOverride, setCentreOverride } from "@/lib/clientSession";
 
-const CENTRES = ["All Centres", "Vasant Vihar", "Rohini", "Noida", "Gurgaon", "Ghaziabad", "Srinagar"];
+interface CentreOption {
+  id: number;
+  name: string;
+}
 
 const ROLE_LABEL: Record<string, string> = {
   doctor: "Doctor",
+  embryologist: "Embryologist",
   centre_head: "Centre Head",
   fc: "Financial Counsellor",
   accounts: "Accounts Team",
@@ -23,7 +28,9 @@ interface UserSession {
   centerName?: string | null;
 }
 
-const SCOPED_ROLES = new Set(["doctor", "centre_head", "fc", "accounts"]);
+// Accounts Team is deliberately NOT scoped — its own login description is
+// "Cross-centre collections & refund execution".
+const SCOPED_ROLES = new Set(["doctor", "embryologist", "centre_head", "fc"]);
 
 function initials(name: string): string {
   const parts = name.trim().split(/\s+/);
@@ -35,6 +42,8 @@ export default function Topbar() {
   const [session, setSession] = useState<UserSession | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [centreOptions, setCentreOptions] = useState<CentreOption[]>([]);
+  const [selectedCentre, setSelectedCentre] = useState<number | "">("");
 
   useEffect(() => {
     try {
@@ -43,7 +52,29 @@ export default function Topbar() {
     } catch {
       // ignore malformed session
     }
+    setSelectedCentre(getCentreOverride() ?? "");
   }, []);
+
+  useEffect(() => {
+    if (!session || SCOPED_ROLES.has(session.role)) return;
+    fetch("/api/centre-comparison", { cache: "no-store" })
+      .then((res) => res.json())
+      .then((rows: { center_number: number; CENTRE: string; EXPECTED: number; ACTUAL: number; AGING_OUTSTANDING: number }[]) => {
+        const active = rows
+          .filter((r) => r.EXPECTED !== 0 || r.ACTUAL !== 0 || r.AGING_OUTSTANDING !== 0)
+          .map((r) => ({ id: r.center_number, name: r.CENTRE }))
+          .sort((a, b) => a.name.localeCompare(b.name));
+        setCentreOptions(active);
+      })
+      .catch(() => setCentreOptions([]));
+  }, [session]);
+
+  function handleCentreChange(value: string) {
+    const centerId = value ? Number(value) : null;
+    setSelectedCentre(centerId ?? "");
+    setCentreOverride(centerId);
+    window.location.reload();
+  }
 
   useEffect(() => {
     const onChange = () => setIsFullscreen(!!document.fullscreenElement);
@@ -62,6 +93,7 @@ export default function Topbar() {
   function handleLogout() {
     localStorage.removeItem("user_session");
     document.cookie = "user_session=; path=/; max-age=0";
+    setCentreOverride(null);
     router.push("/login");
   }
 
@@ -90,11 +122,15 @@ export default function Topbar() {
             <span className="text-primary-dark">{session?.centerName || "Your Centre"}</span>
           ) : (
             <select
-              defaultValue="All Centres"
+              value={selectedCentre}
+              onChange={(e) => handleCentreChange(e.target.value)}
               className="cursor-pointer border-none bg-transparent text-xs font-semibold text-primary-dark outline-none"
             >
-              {CENTRES.map((c) => (
-                <option key={c}>{c}</option>
+              <option value="">All Centres</option>
+              {centreOptions.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.name}
+                </option>
               ))}
             </select>
           )}

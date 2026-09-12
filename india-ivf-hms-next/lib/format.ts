@@ -1,4 +1,14 @@
-export const TODAY = "2026-05-25";
+/**
+ * Formats a Date as YYYY-MM-DD using its LOCAL date parts. `d.toISOString()` converts
+ * through UTC first, which silently rolls the date back a day in any timezone ahead of
+ * UTC (e.g. IST) — this is the safe alternative for anything meant to read as "today"
+ * or a calendar date, as opposed to an instant in time.
+ */
+export function localISODate(d: Date = new Date()): string {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+export const TODAY = localISODate();
 
 export function fmtINR(n: number | null | undefined): string {
   if (n === 0 || n == null) return "₹0";
@@ -21,7 +31,7 @@ export function fmtDate(iso: string | null | undefined): string {
 export function addDays(iso: string, n: number): string {
   const d = new Date(iso + "T00:00:00");
   d.setDate(d.getDate() + n);
-  return d.toISOString().slice(0, 10);
+  return localISODate(d);
 }
 
 export function daysBetween(a: string, b: string): number {

@@ -90,7 +90,7 @@ const res = await fetch('/api/login/', {
           <div className="lb-stats" style={styles.lbStats}>
             <div className="lb-stat"><div style={styles.statNum}>6+</div><div style={styles.statLabel}>Centres</div></div>
             <div className="lb-stat"><div style={styles.statNum}>7</div><div style={styles.statLabel}>Clinical milestones</div></div>
-            <div className="lb-stat"><div style={styles.statNum}>5</div><div style={styles.statLabel}>Role workspaces</div></div>
+            <div className="lb-stat"><div style={styles.statNum}>6</div><div style={styles.statLabel}>Role workspaces</div></div>
           </div>
         </div>
         <div className="lb-foot" style={styles.lbFoot}>© 2026 Pashupati Lifecare Pvt. Ltd. · India IVF Fertility · Conceiving Miracles. Spreading Hope.</div>
@@ -149,8 +149,22 @@ const res = await fetch('/api/login/', {
                 <div style={styles.rcArrow}>{loading ? '...' : '→'}</div>
               </button>
 
-              <button 
-                type="button" 
+              <button
+                type="button"
+                disabled={loading}
+                onClick={(e) => handleLogin(e, 'embryologist')}
+                style={styles.roleCard}
+              >
+                <div style={{ ...styles.rcIc, backgroundColor: '#ede9fe', color: '#7c3aed' }}>🧬</div>
+                <div style={styles.rcBody}>
+                  <div style={styles.rcName}>Embryologist</div>
+                  <div style={styles.rcDesc}>Track lab &amp; embryology procedures</div>
+                </div>
+                <div style={styles.rcArrow}>{loading ? '...' : '→'}</div>
+              </button>
+
+              <button
+                type="button"
                 disabled={loading}
                 onClick={(e) => handleLogin(e, 'centre_head')}
                 style={styles.roleCard}
