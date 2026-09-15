@@ -88,7 +88,7 @@ const res = await fetch('/api/login/', {
           <div className="lb-head" style={styles.lbHead}>One bird's-eye view of every patient, every rupee, every centre.</div>
           <div className="lb-sub" style={styles.lbSub}>From the 10% booking payment to cycle close and final reconciliation — the HMS module that keeps revenue, clinical protocol and patient coordination in tight sync.</div>
           <div className="lb-stats" style={styles.lbStats}>
-            <div className="lb-stat"><div style={styles.statNum}>6+</div><div style={styles.statLabel}>Centres</div></div>
+            <div className="lb-stat"><div style={styles.statNum}>10+</div><div style={styles.statLabel}>Centres</div></div>
             <div className="lb-stat"><div style={styles.statNum}>7</div><div style={styles.statLabel}>Clinical milestones</div></div>
             <div className="lb-stat"><div style={styles.statNum}>6</div><div style={styles.statLabel}>Role workspaces</div></div>
           </div>

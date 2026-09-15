@@ -902,7 +902,7 @@ def get_aging_snapshot(request):
         WHERE p.remaining_amount > 0
           AND (p.status IS NULL OR p.status NOT IN ('cancelled', 'disapproved'))
           {patients_filter_sql}
-        ORDER BY days_overdue DESC;
+        ORDER BY p.on_date DESC;
     """
 
     try:
