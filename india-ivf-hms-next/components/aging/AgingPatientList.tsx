@@ -190,12 +190,12 @@ export default function AgingPatientList({ patients }: { patients: AgingPatient[
         <table className="tbl">
           <thead>
             <tr>
-              <th className="sticky-l">Date</th>
+              <th className="sticky-l" style={{ width: 110, minWidth: 110, maxWidth: 110 }}>Date</th>
+              <th className="sticky-l2" style={{ width: 150, minWidth: 150, maxWidth: 150 }}>IIC ID</th>
+              <th className="sticky-l3" style={{ width: 200, minWidth: 200, maxWidth: 200 }}>Patient Name</th>
               <th>Pkg Month</th>
               <th>Pkg Booking Yr</th>
               <th>FY</th>
-              <th>IIC ID</th>
-              <th>Patient Name</th>
               <th>Pkg Code</th>
               <th>Pkg Description</th>
               <th>Booking Centre</th>
@@ -241,16 +241,22 @@ export default function AgingPatientList({ patients }: { patients: AgingPatient[
               const balFy2627 = inFy2627 ? totalOut : 0;
               return (
                 <tr key={`${p.id}-${p.invoice || i}`}>
-                  <td className="sticky-l">{fmtDate(p.signup)}</td>
-                  <td>{pkgMonthLabel(p.signup)}</td>
-                  <td>{p.signup.slice(0, 4)}</td>
-                  <td>{pkgFY(p.signup)}</td>
-                  <td>
+                  <td className="sticky-l" style={{ width: 110, minWidth: 110, maxWidth: 110 }}>{fmtDate(p.signup)}</td>
+                  <td className="sticky-l2" style={{ width: 150, minWidth: 150, maxWidth: 150 }}>
                     <Link href={`/journey?id=${p.id}`} className="iic-link">
                       {p.id}
                     </Link>
                   </td>
-                  <td className="strong">{p.name}</td>
+                  <td
+                    className="sticky-l3 strong"
+                    style={{ width: 200, minWidth: 200, maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis" }}
+                    title={p.name}
+                  >
+                    {p.name}
+                  </td>
+                  <td>{pkgMonthLabel(p.signup)}</td>
+                  <td>{p.signup.slice(0, 4)}</td>
+                  <td>{pkgFY(p.signup)}</td>
                   <td>{p.pkg}</td>
                   <td>{p.desc}</td>
                   <td>{p.centre}</td>

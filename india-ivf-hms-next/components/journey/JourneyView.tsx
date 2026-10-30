@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, Fragment } from "react";
 import { getClientSession, hidesFinancials } from "@/lib/clientSession";
 import { localISODate } from "@/lib/format";
 
@@ -67,6 +67,11 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
     pending: number;
     breakups: any[];
   } | null>(null);
+
+  // 📂 BOOKED PROCEDURES ACCORDION — which procedure row is currently expanded
+  // to show its own Clinical / Embryology / Compliance forms. Keyed by the
+  // procedure's own entry id (not array index), so it stays stable across refetches.
+  const [expandedProcKey, setExpandedProcKey] = useState<string | number | null>(null);
 
   // Fetch Patient Details from Django Backend
   const fetchPatientDetails = async (idToFetch: string) => {
@@ -193,6 +198,133 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
     setStages(updatedStages);
     setEditingStageIdx(null);
   };
+
+  // Codes to hide from the "Booked Procedures & Services" table — IP218/IP219 are
+  // repeat under-package monitoring scans (Follicle Monitoring / Endometrial
+  // Thickness) that clutter this list; they're still counted everywhere else
+  // (stage linking, payments, etc.), just not shown in this table.
+  const HIDDEN_PROCEDURE_CODES = ["IP218", "IP219"];
+  const visibleProcedures = procedures.filter(
+    (proc: any) => !HIDDEN_PROCEDURE_CODES.includes(String(proc.code || "").trim().toUpperCase())
+  );
+
+  // 🎯 KEY MATCHING LOGIC FOR form_for — shared by the Booked Procedures
+  // accordion AND the Clinical Journey Stages table, so a form is always
+  // classified Clinical vs Embryology the same way everywhere it appears.
+  const isClinicalForm = (f: any) => {
+    const target = String(f.form_for || f.type || "").toLowerCase().trim();
+    const name = String(f.form_name || f.name || "").toLowerCase();
+
+    // Strict check on form_for="daycare_procedure"
+    if (target === "daycare_procedure" || target === "daycare" || target === "clinical") return true;
+
+    // Intelligent fallback keywords if form_for is empty
+    if (!target || target === "general") {
+      if (name.includes("discharge") || name.includes("prescription") || name.includes("induction") || name.includes("check") || name.includes("outcome")) return true;
+    }
+    return false;
+  };
+
+  const isEmbryologyForm = (f: any) => {
+    const target = String(f.form_for || f.type || "").toLowerCase().trim();
+    const name = String(f.form_name || f.name || "").toLowerCase();
+
+    // Strict check on form_for="lab_procedure"
+    if (target === "lab_procedure" || target === "lab" || target === "embryology") return true;
+
+    // Intelligent fallback keywords if form_for is empty
+    if (!target || target === "general") {
+      if (name.includes("embryo") || name.includes("oocyte") || name.includes("sperm") || name.includes("icsi") || name.includes("preparation")) return true;
+    }
+    return false;
+  };
+
+  // `kind` picks the URL path — "procedure_form" for Clinical/Embryology forms,
+  // "check_concern_form" for Compliance/consent forms. Same 4 params either way:
+  // formId/procedureId/appointmentId/patientProcedureId.
+  const buildFormUrl = (proc: any, formId: any, kind: "procedure_form" | "check_concern_form" = "procedure_form") => {
+    const appointmentId = proc.appointment_id || patientProfile?.appointment_id || "0";
+    const patientProcedureId = proc.procedure_entry_id || proc.ID || "0";
+    const procedureId = proc.procedure_id || "0";
+    return `https://indiaivf.website/${kind}/${formId}/${procedureId}/${appointmentId}/${patientProcedureId}`;
+  };
+
+  // 🔓 PAYMENT-GATED FORMS — each procedure form carries its own unlock_percent
+  // (hms_procedure_forms.unlock_percent — "kitna % payment hone par form khule").
+  // A form with unlock_percent=0 is always open. Otherwise it only opens once
+  // that procedure's own payment_done/fees ratio reaches the required %.
+  const isFormUnlocked = (form: any, proc: any): boolean => {
+    const requiredPercent = Number(form?.unlock_percent) || 0;
+    if (requiredPercent <= 0) return true;
+    const fees = Number(proc?.fees) || 0;
+    const paid = Number(proc?.payment_done) || 0;
+    const paidPercent = fees > 0 ? (paid / fees) * 100 : 0;
+    return paidPercent >= requiredPercent;
+  };
+
+  // 🗺️ FORM → STAGE MAPPING — an IVF procedure's forms (e.g. IP11 + IP222
+  // combined) used to be copy-pasted onto every stage row from "Booked"
+  // onward. Instead, each form is matched to the ONE stage it actually
+  // belongs to, by keyword on its name/area. Unmatched forms fall back onto
+  // the "Booked" row instead of silently disappearing. Adjust the keywords
+  // below if a form ever lands on the wrong stage.
+  // A form can belong to more than one stage (e.g. an "outcome" form is
+  // relevant to both B-HCG and Cardiac Activity), so each entry lists every
+  // stage it should appear on.
+  const FORM_STAGE_KEYWORDS: { stageKeys: string[]; keywords: string[] }[] = [
+    { stageKeys: ["Embryo Transfer"], keywords: ["embryo_transfer", "embryo transfer", "transfer_day"] },
+    { stageKeys: ["Endometrial Preparation"], keywords: ["endometrial", "lining"] },
+    { stageKeys: ["Trigger"], keywords: ["trigger"] },
+    { stageKeys: ["OPU"], keywords: ["opu", "ovum", "oocyte", "sperm", "icsi", "fertiliz", "retrieval"] },
+    { stageKeys: ["Ovarian Stimulation"], keywords: ["stimulat", "induction", "follicle"] },
+    { stageKeys: ["Progesterone Change"], keywords: ["progesterone"] },
+    { stageKeys: ["B-HCG"], keywords: ["hcg", "beta"] },
+    { stageKeys: ["Cardiac Activity"], keywords: ["cardiac", "fetal heart", "fhr"] },
+    // A pregnancy "outcome" form covers both the beta-HCG result and the
+    // follow-up cardiac-activity scan, so it shows on both stages.
+    { stageKeys: ["B-HCG", "Cardiac Activity"], keywords: ["outcome"] },
+    { stageKeys: ["Pre-Procedure"], keywords: ["baseline", "pre_procedure", "pre-procedure", "screening", "consent"] },
+  ];
+
+  const matchFormToStageKeys = (form: any): string[] => {
+    const haystack = `${form.form_name || form.name || ""} ${form.form_area || ""}`.toLowerCase();
+    for (const { stageKeys, keywords } of FORM_STAGE_KEYWORDS) {
+      if (keywords.some((kw) => haystack.includes(kw))) return stageKeys;
+    }
+    return ["Booked"]; // unclassified forms still show up (on Booked) instead of vanishing
+  };
+
+  // 🔁 CYCLE GROUPING — an IVF cycle is really a PACKAGE of several codes
+  // booked together (e.g. "IVF (Self Single Cycle till embryo transfer)" =
+  // IP11 + IP222; its repeat booking comes back as a distinctly-named package
+  // too, e.g. "...- 2nd Cycle" = IP223 + IP243; other packages pair up as
+  // IP227/IP228, IP224/IP244, and so on). `proc.category` is where that
+  // package name lives, so group by category — NOT by booking date, since a
+  // package's own codes are already booked together and a genuine repeat
+  // cycle gets its own distinct category string from the backend.
+  const ivfProcedures = procedures.filter(
+    (proc: any) => String(proc.broad_procedure || "").trim().toUpperCase() === "IVF"
+  );
+  const cycleGroupsMap = new Map<string, any[]>();
+  ivfProcedures.forEach((proc: any) => {
+    const categoryKey = String(proc.category || "").trim() || String(proc.procedure_name || "IVF Procedure").trim();
+    if (!cycleGroupsMap.has(categoryKey)) cycleGroupsMap.set(categoryKey, []);
+    cycleGroupsMap.get(categoryKey)!.push(proc);
+  });
+  const cycleGroups =
+    cycleGroupsMap.size > 0
+      ? Array.from(cycleGroupsMap.entries())
+          .map(([label, procs]) => {
+            const earliestDate =
+              procs
+                .map((p: any) => p.on_date)
+                .filter(Boolean)
+                .sort()[0] || null;
+            return { label, date: earliestDate, procedures: procs };
+          })
+          // Chronological order, so cycle 1 lists before "...- 2nd Cycle"
+          .sort((a, b) => (a.date || "").localeCompare(b.date || ""))
+      : [{ label: null as string | null, date: null as string | null, procedures: [] as any[] }];
 
   return (
     <section className="screen-enter max-w-[1700px] mx-auto">
@@ -338,10 +470,10 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
       )}
 
       {/* 📊 BOOKED PROCEDURES TABLE */}
-      {patientProfile && !loading && procedures.length > 0 && (
+      {patientProfile && !loading && visibleProcedures.length > 0 && (
         <div className="mb-6 rounded-[14px] border border-border bg-surface shadow-card overflow-hidden">
           <div className="border-b border-border px-5 py-3.5 flex justify-between items-center bg-surface-2">
-            <h3 className="font-bold text-sm">Booked Procedures &amp; Services ({procedures.length})</h3>
+            <h3 className="font-bold text-sm">Booked Procedures &amp; Services ({visibleProcedures.length})</h3>
             <span className="rounded-full bg-green-soft px-2.5 py-1 text-[10px] font-bold uppercase tracking-wide text-green">
               ● LIVE DATA
             </span>
@@ -350,6 +482,7 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
             <table className="w-full text-left text-xs">
               <thead className="bg-surface border-b border-border font-semibold text-text-mid">
                 <tr>
+                  <th className="p-3 w-8"></th>
                   <th className="p-3">Date</th>
                   <th className="p-3">Category</th>
                   <th className="p-3">{hideFinancials ? "Code" : "Code (Click to View Partial Payments)"}</th>
@@ -365,61 +498,205 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
                 </tr>
               </thead>
               <tbody>
-                {procedures.map((proc, idx) => (
-                  <tr key={idx} className="border-b border-border-soft hover:bg-surface-2/60 transition">
-                    <td className="p-3 font-semibold text-slate-600">{proc.on_date || "—"}</td>
-                    <td className="p-3">
-                      <span className="rounded bg-blue-100 px-2 py-0.5 text-[10px] font-bold text-blue-700">
-                        {proc.category || "Non IVF without Bed"}
-                      </span>
-                    </td>
-                    <td className="p-3">
-                      {hideFinancials ? (
-                        <span className="bg-amber-100 text-amber-900 px-2.5 py-1 rounded-md font-bold inline-flex items-center gap-1 border border-amber-300">
-                          <span>🏷️</span>
-                          <span>{proc.code || "IP288"}</span>
-                        </span>
-                      ) : (
-                        <button
-                          type="button"
-                          onClick={() =>
-                            setActivePaymentModal({
-                              procedureName: proc.procedure_name,
-                              code: proc.code || "PROC",
-                              receiptNo: proc.receipt_number,
-                              fees: proc.fees,
-                              paymentDone: proc.payment_done,
-                              pending: proc.pending,
-                              breakups: proc.payment_breakups || [],
-                            })
-                          }
-                          className="bg-amber-100 text-amber-900 hover:bg-amber-200 px-2.5 py-1 rounded-md font-bold transition shadow-sm border border-amber-300 inline-flex items-center gap-1 cursor-pointer"
-                          title="Click to view partial payment breakups"
-                        >
-                          <span>🏷️</span>
-                          <span>{proc.code || "IP288"}</span>
-                        </button>
+                {visibleProcedures.map((proc, idx) => {
+                  const procKey = proc.procedure_entry_id ?? proc.ID ?? `${proc.code}-${idx}`;
+                  const isExpanded = expandedProcKey === procKey;
+                  const colCount = hideFinancials ? 6 : 9;
+
+                  // This procedure's own forms — same classification helpers used
+                  // by the Clinical Journey Stages table below, so a form reads the
+                  // same way everywhere it's shown.
+                  const procRawForms: any[] = proc.linked_forms || proc.forms || [];
+                  const procClinicalForms = procRawForms.filter(isClinicalForm);
+                  const procEmbryologyForms = procRawForms.filter(isEmbryologyForm);
+                  const procConcernForms: any[] = proc.linked_concern_forms || [];
+
+                  return (
+                    <Fragment key={procKey}>
+                      <tr
+                        onClick={() => setExpandedProcKey(isExpanded ? null : procKey)}
+                        className="border-b border-border-soft hover:bg-surface-2/60 transition cursor-pointer"
+                        title="Click row to view this procedure's linked forms"
+                      >
+                        <td className="p-3 text-center text-text-soft">
+                          <span className={`inline-block transition-transform ${isExpanded ? "rotate-90" : ""}`}>▶</span>
+                        </td>
+                        <td className="p-3 font-semibold text-slate-600">{proc.on_date || "—"}</td>
+                        <td className="p-3">
+                          <span className="rounded bg-blue-100 px-2 py-0.5 text-[10px] font-bold text-blue-700">
+                            {proc.category || "Non IVF without Bed"}
+                          </span>
+                        </td>
+                        <td className="p-3">
+                          {hideFinancials ? (
+                            <span className="bg-amber-100 text-amber-900 px-2.5 py-1 rounded-md font-bold inline-flex items-center gap-1 border border-amber-300">
+                              <span>🏷️</span>
+                              <span>{proc.code || "IP288"}</span>
+                            </span>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setActivePaymentModal({
+                                  procedureName: proc.procedure_name,
+                                  code: proc.code || "PROC",
+                                  receiptNo: proc.receipt_number,
+                                  fees: proc.fees,
+                                  paymentDone: proc.payment_done,
+                                  pending: proc.pending,
+                                  breakups: proc.payment_breakups || [],
+                                });
+                              }}
+                              className="bg-amber-100 text-amber-900 hover:bg-amber-200 px-2.5 py-1 rounded-md font-bold transition shadow-sm border border-amber-300 inline-flex items-center gap-1 cursor-pointer"
+                              title="Click to view partial payment breakups"
+                            >
+                              <span>🏷️</span>
+                              <span>{proc.code || "IP288"}</span>
+                            </button>
+                          )}
+                        </td>
+                        <td className="p-3 font-bold text-text-dark">{proc.procedure_name || "—"}</td>
+                        <td className="p-3 text-text-soft">{proc.receipt_number || "—"}</td>
+                        {!hideFinancials && (
+                          <>
+                            <td className="p-3 text-right font-medium">₹ {proc.fees?.toLocaleString("en-IN")}</td>
+                            <td className="p-3 text-right font-bold text-green-600">
+                              ₹ {proc.payment_done?.toLocaleString("en-IN")}
+                            </td>
+                            <td
+                              className={`p-3 text-right font-bold ${
+                                proc.pending > 0 ? "text-red-500" : "text-green-600"
+                              }`}
+                            >
+                              ₹ {proc.pending?.toLocaleString("en-IN")}
+                            </td>
+                          </>
+                        )}
+                      </tr>
+
+                      {/* 📂 EXPANDED — all forms linked to THIS specific procedure code */}
+                      {isExpanded && (
+                        <tr className="bg-surface-2/40 border-b border-border-soft">
+                          <td colSpan={colCount} className="p-4">
+                            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                              <div>
+                                <div className="text-[10px] font-bold uppercase tracking-wide text-blue-600 mb-1.5">
+                                  Clinical Forms
+                                </div>
+                                {procClinicalForms.length > 0 ? (
+                                  <div className="flex flex-wrap gap-1.5">
+                                    {procClinicalForms.map((frm: any, fIdx: number) => {
+                                      const isFilledInDB = Boolean(frm.is_filled || frm.filled);
+                                      const formId = frm.form_id || frm.ID || "0";
+                                      if (!isFormUnlocked(frm, proc)) {
+                                        return (
+                                          <span
+                                            key={fIdx}
+                                            className="inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-[11px] font-bold shadow-sm bg-slate-200 text-slate-500 border border-slate-300 cursor-not-allowed"
+                                            title={`Unlocks at ${frm.unlock_percent}% payment`}
+                                          >
+                                            <span>🔒</span>
+                                            <span>{frm.form_name || frm.name}</span>
+                                          </span>
+                                        );
+                                      }
+                                      return (
+                                        <a
+                                          key={fIdx}
+                                          href={buildFormUrl(proc, formId)}
+                                          target="_blank"
+                                          rel="noopener noreferrer"
+                                          onClick={(e) => e.stopPropagation()}
+                                          className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-[11px] font-bold shadow-sm transition-transform hover:scale-105 ${
+                                            isFilledInDB
+                                              ? "bg-[#2563eb] text-white border border-[#1d4ed8]"
+                                              : "bg-[#e11d48] text-white border border-[#be123c]"
+                                          }`}
+                                        >
+                                          <span>{isFilledInDB ? "✓" : "✎"}</span>
+                                          <span>{frm.form_name || frm.name}</span>
+                                        </a>
+                                      );
+                                    })}
+                                  </div>
+                                ) : (
+                                  <span className="text-text-soft italic text-[11px]">— None linked</span>
+                                )}
+                              </div>
+
+                              <div>
+                                <div className="text-[10px] font-bold uppercase tracking-wide text-purple-600 mb-1.5">
+                                  Embryology Forms
+                                </div>
+                                {procEmbryologyForms.length > 0 ? (
+                                  <div className="flex flex-wrap gap-1.5">
+                                    {procEmbryologyForms.map((frm: any, fIdx: number) => {
+                                      const isFilledInDB = Boolean(frm.is_filled || frm.filled);
+                                      const formId = frm.form_id || frm.ID || "0";
+                                      if (!isFormUnlocked(frm, proc)) {
+                                        return (
+                                          <span
+                                            key={fIdx}
+                                            className="inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-[11px] font-bold shadow-sm bg-slate-200 text-slate-500 border border-slate-300 cursor-not-allowed"
+                                            title={`Unlocks at ${frm.unlock_percent}% payment`}
+                                          >
+                                            <span>🔒</span>
+                                            <span>{frm.form_name || frm.name}</span>
+                                          </span>
+                                        );
+                                      }
+                                      return (
+                                        <a
+                                          key={fIdx}
+                                          href={buildFormUrl(proc, formId)}
+                                          target="_blank"
+                                          rel="noopener noreferrer"
+                                          onClick={(e) => e.stopPropagation()}
+                                          className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-[11px] font-bold shadow-sm transition-transform hover:scale-105 ${
+                                            isFilledInDB
+                                              ? "bg-[#7c3aed] text-white border border-[#6d28d9]"
+                                              : "bg-[#e11d48] text-white border border-[#be123c]"
+                                          }`}
+                                        >
+                                          <span>{isFilledInDB ? "✓" : "✎"}</span>
+                                          <span>{frm.form_name || frm.name}</span>
+                                        </a>
+                                      );
+                                    })}
+                                  </div>
+                                ) : (
+                                  <span className="text-text-soft italic text-[11px]">— None linked</span>
+                                )}
+                              </div>
+
+                              <div>
+                                <div className="text-[10px] font-bold uppercase tracking-wide text-slate-500 mb-1.5">
+                                  Compliance / Consent Forms
+                                </div>
+                                {procConcernForms.length > 0 ? (
+                                  <div className="flex flex-wrap gap-1.5">
+                                    {procConcernForms.map((cf: any, cfIdx: number) => (
+                                      <span
+                                        key={cf.form_id || cfIdx}
+                                        className="inline-block rounded bg-blue-50 border border-blue-200 px-2 py-1 text-[10.5px] font-bold text-blue-800"
+                                        title={cf.form_for || cf.type || ""}
+                                      >
+                                        {cf.form_name}
+                                      </span>
+                                    ))}
+                                  </div>
+                                ) : (
+                                  <span className="text-text-soft italic text-[11px]">— None linked</span>
+                                )}
+                              </div>
+                            </div>
+                          </td>
+                        </tr>
                       )}
-                    </td>
-                    <td className="p-3 font-bold text-text-dark">{proc.procedure_name || "—"}</td>
-                    <td className="p-3 text-text-soft">{proc.receipt_number || "—"}</td>
-                    {!hideFinancials && (
-                      <>
-                        <td className="p-3 text-right font-medium">₹ {proc.fees?.toLocaleString("en-IN")}</td>
-                        <td className="p-3 text-right font-bold text-green-600">
-                          ₹ {proc.payment_done?.toLocaleString("en-IN")}
-                        </td>
-                        <td
-                          className={`p-3 text-right font-bold ${
-                            proc.pending > 0 ? "text-red-500" : "text-green-600"
-                          }`}
-                        >
-                          ₹ {proc.pending?.toLocaleString("en-IN")}
-                        </td>
-                      </>
-                    )}
-                  </tr>
-                ))}
+                    </Fragment>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -469,10 +746,27 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
       )}
 
       {/* 📊 FULL MULTI-TRACK CLINICAL JOURNEY STAGES TABLE */}
-      {patientProfile && !loading && stages.length > 0 && (
+      {patientProfile && !loading && stages.length > 0 && (() => {
+        // Column count for the "Cycle N" divider row's colSpan — must track
+        // every optional column below exactly.
+        const stageColCount =
+          1 + // Stage
+          (hiddenTracks.has("comm") ? 0 : 1) + // Patient Comm
+          1 + // Ideal Schedule
+          (hiddenTracks.has("plan") ? 0 : 1) + // Change in Plan
+          1 + // Linked Procedure
+          (!hideClinicalForms && !hiddenTracks.has("clinical_forms") ? 1 : 0) +
+          (!hiddenTracks.has("embryo_forms") ? 1 : 0) +
+          (!hideFinancials && !hiddenTracks.has("financial") ? 1 : 0) +
+          (!hiddenTracks.has("compliances") ? 1 : 0);
+
+        return (
         <div className="rounded-[14px] border border-border bg-surface shadow-card overflow-hidden">
           <div className="border-b border-border px-5 py-4 flex justify-between items-center bg-surface-2">
-            <h3 className="font-bold text-sm">Clinical Journey Stages &amp; Milestones ({stages.length})</h3>
+            <h3 className="font-bold text-sm">
+              Clinical Journey Stages &amp; Milestones ({stages.length}
+              {cycleGroups.length > 1 ? ` × ${cycleGroups.length} cycles` : ""})
+            </h3>
             <span className="rounded-full bg-green-soft px-2.5 py-1 text-[10px] font-bold uppercase tracking-wide text-green">
               ● Django Live Synced
             </span>
@@ -509,55 +803,68 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
                 </tr>
               </thead>
               <tbody>
-                {stages.map((stg, i) => {
+                {cycleGroups.map((cycle, cIdx) => (
+                  <Fragment key={cIdx}>
+                    {cycleGroups.length > 1 && (
+                      <tr className="bg-slate-100 border-b border-border">
+                        <td colSpan={stageColCount} className="p-2.5 font-bold text-slate-700 text-[11px] uppercase tracking-wide">
+                          🔁 {cycle.label}{cycle.date ? ` — Booked ${cycle.date}` : ""}
+                        </td>
+                      </tr>
+                    )}
+                    {stages.map((stg, i) => {
                   if (collapseDone && stg.status === "done") return null;
 
-                  const linkedProc = procedures[i] || procedures[0] || {};
-                  
-                  // Gather all forms safely
-                  const rawForms: any[] =
-                    linkedProc.linked_forms ||
-                    linkedProc.forms ||
-                    stg.linked_forms ||
-                    stg.forms ||
-                    [];
+                  const isBookedOrLater = i >= 2 || stg.key === "Booked";
+                  const cycleProcedures = cycle.procedures;
 
-                  // 🎯 KEY MATCHING LOGIC FOR form_for
-                  const isClinicalForm = (f: any) => {
-                    const target = String(f.form_for || f.type || "").toLowerCase().trim();
-                    const name = String(f.form_name || f.name || "").toLowerCase();
-                    
-                    // Strict check on form_for="daycare_procedure"
-                    if (target === "daycare_procedure" || target === "daycare" || target === "clinical") return true;
-                    
-                    // Intelligent fallback keywords if form_for is empty
-                    if (!target || target === "general") {
-                      if (name.includes("discharge") || name.includes("prescription") || name.includes("induction") || name.includes("check")) return true;
-                    }
-                    return false;
-                  };
+                  // Combine every form across THIS cycle's procedures (e.g. IP11 +
+                  // IP222 booked together), then keep only the ones that actually
+                  // match this stage (by name/area keyword — see matchFormToStageKeys
+                  // above) instead of copy-pasting the whole pool onto every row.
+                  // Each form keeps a reference to its own source procedure, so its
+                  // "fill form" link points at the right procedure/appointment.
+                  const clinicalForms: any[] = [];
+                  const embryologyForms: any[] = [];
+                  if (isBookedOrLater) {
+                    cycleProcedures.forEach((cproc: any) => {
+                      const rawForms: any[] = cproc.linked_forms || cproc.forms || [];
+                      rawForms.forEach((f: any) => {
+                        if (!matchFormToStageKeys(f).includes(stg.key)) return;
+                        const tagged = { ...f, _sourceProc: cproc };
+                        if (isEmbryologyForm(f)) embryologyForms.push(tagged);
+                        // Anything not clearly embryology/lab defaults to Clinical —
+                        // a form that matched neither used to vanish silently here
+                        // (this is exactly how the "outcome" form went missing).
+                        else clinicalForms.push(tagged);
+                      });
+                    });
+                  }
 
-                  const isEmbryologyForm = (f: any) => {
-                    const target = String(f.form_for || f.type || "").toLowerCase().trim();
-                    const name = String(f.form_name || f.name || "").toLowerCase();
+                  // Every procedure code in this cycle, shown from "Booked" onward
+                  // (this is what now lets IP11 AND IP222 both show up, instead of
+                  // only ever the first IVF procedure found).
+                  const linkedProcsForRow: any[] = isBookedOrLater ? cycleProcedures : [];
 
-                    // Strict check on form_for="lab_procedure"
-                    if (target === "lab_procedure" || target === "lab" || target === "embryology") return true;
+                  // Compliance/consent forms are signed once at booking, not
+                  // re-shown at every later milestone — so only the "Booked" row
+                  // of this cycle lists them (previously every Booked+ row
+                  // repeated the full ~30-form consent list, which is what made
+                  // this column feel like a wall of duplicated badges).
+                  const concernForms: any[] =
+                    stg.key === "Booked"
+                      ? Array.from(
+                          new Map(
+                            cycleProcedures
+                              .flatMap((cproc: any) =>
+                                (cproc.linked_concern_forms || []).map((cf: any) => ({ ...cf, _sourceProc: cproc }))
+                              )
+                              .map((cf: any) => [cf.form_id ?? cf.form_name, cf])
+                          ).values()
+                        )
+                      : [];
 
-                    // Intelligent fallback keywords if form_for is empty
-                    if (!target || target === "general") {
-                      if (name.includes("embryo") || name.includes("oocyte") || name.includes("sperm") || name.includes("icsi") || name.includes("preparation")) return true;
-                    }
-                    return false;
-                  };
-
-                  // Filter Clinical & Embryology Forms
-                  const clinicalForms = rawForms.filter(isClinicalForm);
-                  const embryologyForms = rawForms.filter(isEmbryologyForm);
-
-                  const appointmentId = linkedProc.appointment_id || patientProfile?.appointment_id || "0";
-                  const patientProcedureId = linkedProc.procedure_entry_id || linkedProc.ID || "0";
-                  const procedureId = linkedProc.procedure_id || "0";
+                  const primaryProc = cycleProcedures[0] || {};
 
                   const matchedDonor =
                     donors.find((d) =>
@@ -574,7 +881,7 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
                       : "";
 
                   return (
-                    <tr key={i} className={`border-b border-border-soft hover:bg-surface-2/60 transition ${rowBg}`}>
+                    <tr key={`${cIdx}-${i}`} className={`border-b border-border-soft hover:bg-surface-2/60 transition ${rowBg}`}>
                       {/* 1. Stage Name */}
                       <td className="p-3.5">
                         <div className="flex items-center gap-2">
@@ -712,26 +1019,21 @@ return (
   </td>
 )}
 
-{/* 5. LINKED PROCEDURE (Only for broad_procedure = "IVF" starting from 'Booked' stage) */}
+{/* 5. LINKED PROCEDURE — every IVF procedure in this cycle (IP11, IP222, …),
+    starting from the 'Booked' stage, instead of only ever the first match. */}
 <td className="p-3.5">
-  {(() => {
-// 🔍 1. Find IVF procedure from procedures list (Case-insensitive check)
-const ivfProcedure = procedures.find(
-  (proc: any) => String(proc.broad_procedure || "").trim().toUpperCase() === "IVF"
-);
-
-// 🔒 2. Condition Check: Stage 'Booked' ya uske baad honi chahiye AND IVF procedure hona chahiye
-const isBookedOrLater = i >= 2 || stg.key === "Booked";
-
-if (isBookedOrLater && ivfProcedure) {
-  return (
+  {linkedProcsForRow.length > 0 ? (
     <div>
-      <div className="font-bold text-text">
-        {ivfProcedure.procedure_name || stg.key}
+      <div className="space-y-1.5">
+        {linkedProcsForRow.map((lp: any, lpIdx: number) => (
+          <div key={lpIdx}>
+            <div className="font-bold text-text">{lp.procedure_name || stg.key}</div>
+            <code className="bg-amber-50 text-amber-800 px-1.5 py-0.5 rounded text-[10.5px] font-bold">
+              {lp.code || "IP64"}
+            </code>
+          </div>
+        ))}
       </div>
-      <code className="bg-amber-50 text-amber-800 px-1.5 py-0.5 rounded text-[10.5px] font-bold">
-        {ivfProcedure.code || "IP64"}
-      </code>
 
       {/* Donor / Surrogate Trigger */}
       {matchedDonor &&
@@ -756,15 +1058,11 @@ if (isBookedOrLater && ivfProcedure) {
           </div>
         )}
     </div>
-  );
-}
-
-return (
-  <span className="text-text-soft italic text-[11px]">
-    — No IVF procedure booked
-  </span>
-);
-  })()}
+  ) : (
+    <span className="text-text-soft italic text-[11px]">
+      — No IVF procedure booked
+    </span>
+  )}
 </td>
 
                       {/* 🔵 6. CLINICAL FORMS (daycare_procedure) */}
@@ -775,7 +1073,22 @@ return (
                               {clinicalForms.map((frm: any, fIdx: number) => {
                                 const isFilledInDB = Boolean(frm.is_filled || frm.filled);
                                 const formId = frm.form_id || frm.ID || "0";
-                                const targetUrl = `https://indiaivf.website/procedure_form/${formId}/${procedureId}/${appointmentId}/${patientProcedureId}`;
+                                const sourceProc = frm._sourceProc || primaryProc;
+                                const unlocked = isFormUnlocked(frm, sourceProc);
+                                const targetUrl = buildFormUrl(sourceProc, formId);
+
+                                if (!unlocked) {
+                                  return (
+                                    <span
+                                      key={fIdx}
+                                      className="inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-[11px] font-bold shadow-sm bg-slate-200 text-slate-500 border border-slate-300 cursor-not-allowed"
+                                      title={`Unlocks at ${frm.unlock_percent}% payment`}
+                                    >
+                                      <span>🔒</span>
+                                      <span>{frm.form_name || frm.name}</span>
+                                    </span>
+                                  );
+                                }
 
                                 return (
                                   <a
@@ -809,7 +1122,22 @@ return (
                               {embryologyForms.map((frm: any, fIdx: number) => {
                                 const isFilledInDB = Boolean(frm.is_filled || frm.filled);
                                 const formId = frm.form_id || frm.ID || "0";
-                                const targetUrl = `https://indiaivf.website/procedure_form/${formId}/${procedureId}/${appointmentId}/${patientProcedureId}`;
+                                const sourceProc = frm._sourceProc || primaryProc;
+                                const unlocked = isFormUnlocked(frm, sourceProc);
+                                const targetUrl = buildFormUrl(sourceProc, formId);
+
+                                if (!unlocked) {
+                                  return (
+                                    <span
+                                      key={fIdx}
+                                      className="inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-[11px] font-bold shadow-sm bg-slate-200 text-slate-500 border border-slate-300 cursor-not-allowed"
+                                      title={`Unlocks at ${frm.unlock_percent}% payment`}
+                                    >
+                                      <span>🔒</span>
+                                      <span>{frm.form_name || frm.name}</span>
+                                    </span>
+                                  );
+                                }
 
                                 return (
                                   <a
@@ -839,7 +1167,7 @@ return (
                       {!hideFinancials && !hiddenTracks.has("financial") && (
                         <td className="p-3.5 text-right">
                           <div className="font-bold text-text">
-                            ₹ {(linkedProc.fees || patientProfile.fees / stages.length).toLocaleString("en-IN")}
+                            ₹ {(primaryProc.fees || patientProfile.fees / stages.length).toLocaleString("en-IN")}
                           </div>
                           <div
                             className={`text-[10.5px] font-semibold ${
@@ -851,36 +1179,27 @@ return (
                         </td>
                       )}
 
-                      {/* 9. Compliances */}
+                      {/* 9. Compliances — linked from hms_concern_relation / hms_concern_forms,
+                          combined across every procedure in this cycle (not tied to one
+                          specific clinical day), not the generic procedure forms. */}
                       {!hiddenTracks.has("compliances") && (
                         <td className="p-3.5 text-center">
-                          {rawForms.length > 0 ? (
-                            (() => {
-                              const isAllFilled = rawForms.every((f: any) => f.is_filled || f.filled);
-                              const firstForm = rawForms[0];
-                              const firstFormId = firstForm?.form_id || firstForm?.ID || "0";
-                              const firstTargetUrl = `https://indiaivf.website/procedure_form/${firstFormId}/${procedureId}/${appointmentId}/${patientProcedureId}`;
-
-                              return isAllFilled ? (
+                          {concernForms.length > 0 ? (
+                            <div className="flex flex-wrap justify-center gap-1.5">
+                              {concernForms.map((cf: any, cfIdx: number) => (
                                 <a
-                                  href={firstTargetUrl}
+                                  key={cf.form_id || cfIdx}
+                                  href={buildFormUrl(cf._sourceProc || primaryProc, cf.form_id, "check_concern_form")}
                                   target="_blank"
                                   rel="noopener noreferrer"
-                                  className="inline-block rounded bg-green-100 border border-green-300 px-2.5 py-1 text-[10.5px] font-bold text-green-700 hover:bg-green-200 transition"
+                                  className="inline-flex items-center gap-1 rounded bg-blue-50 border border-blue-200 px-2 py-1 text-[10.5px] font-bold text-blue-800 shadow-sm transition-transform hover:scale-105 hover:bg-blue-100"
+                                  title={cf.form_for || cf.type || ""}
                                 >
-                                  ✓ Consent OK
+                                  <span>✎</span>
+                                  <span>{cf.form_name}</span>
                                 </a>
-                              ) : (
-                                <a
-                                  href={firstTargetUrl}
-                                  target="_blank"
-                                  rel="noopener noreferrer"
-                                  className="inline-block rounded bg-amber-100 border border-amber-300 px-2.5 py-1 text-[10.5px] font-bold text-amber-800 hover:bg-amber-200 transition"
-                                >
-                                  ⚠️ Consent Pending
-                                </a>
-                              );
-                            })()
+                              ))}
+                            </div>
                           ) : (
                             <span className="text-text-soft text-[11px]">—</span>
                           )}
@@ -888,12 +1207,15 @@ return (
                       )}
                     </tr>
                   );
-                })}
+                    })}
+                  </Fragment>
+                ))}
               </tbody>
             </table>
           </div>
         </div>
-      )}
+        );
+      })()}
 
       {/* 💵 PARTIAL PAYMENT LEDGER BREAKDOWN MODAL */}
       {activePaymentModal && (

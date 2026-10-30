@@ -119,6 +119,22 @@ h1, h2, h3, h4 {
   table.tbl .strong { color: var(--color-text); font-weight: 600; }
   table.tbl .sn-col { color: var(--color-text-soft); width: 36px; }
   table.tbl .sticky-l { position: sticky; left: 0; background: var(--color-surface); z-index: 1; }
+  /* Aging list: Date (110px) + IIC ID (150px) + Patient Name stay pinned together.
+     Offsets match the fixed widths set on those columns in AgingPatientList. */
+  table.tbl .sticky-l2 { position: sticky; left: 110px; background: var(--color-surface); z-index: 1; }
+  table.tbl .sticky-l3 {
+    position: sticky;
+    left: 260px;
+    background: var(--color-surface);
+    z-index: 1;
+    box-shadow: 1px 0 0 var(--color-border), 4px 0 6px -4px rgba(60, 40, 50, .12);
+  }
+  table.tbl th.sticky-l,
+  table.tbl th.sticky-l2,
+  table.tbl th.sticky-l3 { background: var(--color-surface-2); z-index: 2; }
+  table.tbl tbody tr:hover td.sticky-l,
+  table.tbl tbody tr:hover td.sticky-l2,
+  table.tbl tbody tr:hover td.sticky-l3 { background: var(--color-surface-2); }
   .pt-name { font-weight: 600; color: var(--color-text); white-space: nowrap; }
   .pt-id { font-size: 11px; color: var(--color-text-soft); }
   .iic-link, .bpl-iic {

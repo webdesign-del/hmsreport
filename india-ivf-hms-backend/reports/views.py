@@ -459,6 +459,8 @@ def get_patient_profile_detail(request):
             proc.code,
             proc.category,
             proc.broad_procedure,
+            proc_master.broad_procedure_code AS cycle_group_code,
+            proc_master.cycle AS cycle_stage_label,
             proc.fees,
             proc.on_date,
             IFNULL(pay_clean.total_paid, 0) AS payment_done,
@@ -468,10 +470,18 @@ def get_patient_profile_detail(request):
             GROUP_CONCAT(DISTINCT pf.form_area SEPARATOR '||') AS form_areas,
             GROUP_CONCAT(DISTINCT pf.type SEPARATOR '||') AS form_types,
             GROUP_CONCAT(DISTINCT IFNULL(pf.form_for, '') SEPARATOR '||') AS form_fors,
+            GROUP_CONCAT(DISTINCT IFNULL(pf.unlock_percent, 0) SEPARATOR '||') AS form_unlock_percents,
+            GROUP_CONCAT(DISTINCT cf.id SEPARATOR '||') AS concern_form_ids,
+            GROUP_CONCAT(DISTINCT cf.form_name SEPARATOR '||') AS concern_form_names,
+            GROUP_CONCAT(DISTINCT IFNULL(cf.form_for, '') SEPARATOR '||') AS concern_form_fors,
+            GROUP_CONCAT(DISTINCT IFNULL(cf.type, '') SEPARATOR '||') AS concern_form_types,
             GROUP_CONCAT(DISTINCT CONCAT(IFNULL(pay_hist.on_date, ''), '::', IFNULL(pay_hist.billing_id, ''), '::', IFNULL(pay_hist.payment_done, 0), '::Cash') SEPARATOR '||') AS payment_history
         FROM hms_patient_procedure proc
+        LEFT JOIN hms_procedures proc_master ON proc.procedure_id = proc_master.ID
         LEFT JOIN hms_form_relationship fr ON proc.procedure_id = fr.procedure_id
         LEFT JOIN hms_procedure_forms pf ON fr.form_id = pf.ID
+        LEFT JOIN hms_concern_relation cr ON proc.procedure_id = cr.procedures_id
+        LEFT JOIN hms_concern_forms cf ON cr.concern_id = cf.id AND cf.status = 'active'
         LEFT JOIN hms_patient_payments pay_hist ON proc.receipt_number = pay_hist.billing_id AND pay_hist.status IN ('0', '1')
         LEFT JOIN (
             SELECT billing_id, SUM(payment_done) AS total_paid 
@@ -479,7 +489,8 @@ def get_patient_profile_detail(request):
             WHERE status IN ('0', '1')
             GROUP BY billing_id
         ) pay_clean ON proc.receipt_number = pay_clean.billing_id
-        WHERE proc.patient_id = %s OR proc.receipt_number = %s
+        WHERE (proc.patient_id = %s OR proc.receipt_number = %s)
+          AND proc.status IN ('pending', 'approved')
         GROUP BY proc.ID
         ORDER BY proc.on_date DESC, proc.ID DESC;
     """
@@ -590,20 +601,46 @@ def get_patient_profile_detail(request):
                 f_areas = p_dict['form_areas'].split('||') if p_dict.get('form_areas') else []
                 f_types = p_dict['form_types'].split('||') if p_dict.get('form_types') else []
                 f_fors = p_dict['form_fors'].split('||') if p_dict.get('form_fors') else []
+                f_unlocks = p_dict['form_unlock_percents'].split('||') if p_dict.get('form_unlock_percents') else []
 
                 forms_array = []
                 for idx in range(len(f_names)):
                     table_name = f_areas[idx] if idx < len(f_areas) else ""
                     is_filled_in_db = check_form_data_exists(actual_patient_id, p_dict['receipt_number'], p_dict['procedure_id'], table_name)
+                    try:
+                        unlock_percent = int(float(f_unlocks[idx])) if idx < len(f_unlocks) and f_unlocks[idx] != '' else 0
+                    except (ValueError, TypeError):
+                        unlock_percent = 0
                     forms_array.append({
                         'form_id': f_ids[idx] if idx < len(f_ids) else None,
                         'form_name': f_names[idx],
                         'form_area': table_name,
                         'type': f_types[idx] if idx < len(f_types) else 'general',
                         'form_for': f_fors[idx] if idx < len(f_fors) else '',
+                        'unlock_percent': unlock_percent,
                         'is_filled': is_filled_in_db
                     })
                 p_dict['linked_forms'] = forms_array
+
+                # Consent / Compliance Forms (hms_concern_relation -> hms_concern_forms,
+                # already filtered to active forms via cf.status = 'active' in the query)
+                cf_ids = p_dict['concern_form_ids'].split('||') if p_dict.get('concern_form_ids') else []
+                cf_names = p_dict['concern_form_names'].split('||') if p_dict.get('concern_form_names') else []
+                cf_fors = p_dict['concern_form_fors'].split('||') if p_dict.get('concern_form_fors') else []
+                cf_types = p_dict['concern_form_types'].split('||') if p_dict.get('concern_form_types') else []
+
+                concern_forms_array = []
+                for idx in range(len(cf_names)):
+                    if not cf_names[idx]:
+                        continue
+                    concern_forms_array.append({
+                        'form_id': cf_ids[idx] if idx < len(cf_ids) else None,
+                        'form_name': cf_names[idx],
+                        'form_for': cf_fors[idx] if idx < len(cf_fors) else '',
+                        'type': cf_types[idx] if idx < len(cf_types) else 'general',
+                    })
+                p_dict['linked_concern_forms'] = concern_forms_array
+
                 procedures_list.append(p_dict)
 
             # Stage Map
@@ -1043,6 +1080,10 @@ def get_prebook_data(request):
     # produced a row in hms_patient_procedure. hms_patient_procedure.appointment_id has no
     # index, so a JOIN against it forces a full nested-loop scan (20-30s+); NOT IN against the
     # small distinct-appointment_id subquery lets MySQL hash it instead, which is near-instant.
+    # Rule (patient level): a patient is CNB when they have a row in hms_consultation and NO row at
+    # all in hms_patient_procedure (any status, any appointment). Excluding by appointment alone
+    # isn't enough — a patient who booked earlier and consulted again on a new appointment would
+    # still show up — so the patient_id check below is what actually decides it.
     cnb_query = f"""
         SELECT
             COALESCE(NULLIF(TRIM(a.paitent_id), ''), CAST(a.id AS CHAR)) AS id,
@@ -1062,6 +1103,15 @@ def get_prebook_data(request):
         LEFT JOIN reports_patientcnb r
             ON r.patient_id = CONVERT(COALESCE(NULLIF(TRIM(a.paitent_id), ''), CAST(a.id AS CHAR)) USING utf8mb4) COLLATE utf8mb4_general_ci
         WHERE hc.appointment_id NOT IN (SELECT DISTINCT appointment_id FROM hms_patient_procedure)
+          AND (
+                COALESCE(NULLIF(TRIM(hc.patient_id), ''), NULLIF(TRIM(a.paitent_id), '')) IS NULL
+                OR CONVERT(COALESCE(NULLIF(TRIM(hc.patient_id), ''), TRIM(a.paitent_id)) USING utf8mb4) COLLATE utf8mb4_general_ci NOT IN (
+                    SELECT DISTINCT CONVERT(TRIM(bp.patient_id) USING utf8mb4) COLLATE utf8mb4_general_ci
+                    FROM hms_patient_procedure bp
+                    WHERE bp.patient_id IS NOT NULL
+                      AND TRIM(bp.patient_id) <> ''
+                )
+              )
           {cnb_centre_filter_sql}
         ORDER BY hc.on_date DESC;
     """
