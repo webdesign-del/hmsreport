@@ -5,6 +5,7 @@ import Link from "next/link";
 import { TODAY, fmtDate } from "@/lib/format";
 import type { PrebookPatient, PrebookType } from "@/lib/types";
 import { Card, PageHead, TableWrap } from "@/components/ui";
+import { getClientSession, isReadOnlyRole } from "@/lib/clientSession";
 
 const LABELS: Record<PrebookType, string> = { scheduled: "Appointments Scheduled", missed: "Missed Appointments", cnb: "Consulted Not Booked" };
 const DATE_LABELS: Record<PrebookType, string> = { scheduled: "Date of Appointment", missed: "Date of Missed Appointment", cnb: "Date of Consult" };
@@ -57,6 +58,11 @@ export default function PrebookList({ type, prebook }: { type: PrebookType; preb
   const safePage = Math.min(page, totalPages);
   const pageStart = (safePage - 1) * pageSize;
   const paged = list.slice(pageStart, pageStart + pageSize);
+
+  const [readOnly, setReadOnly] = useState(false);
+  useEffect(() => {
+    setReadOnly(isReadOnlyRole(getClientSession()?.role));
+  }, []);
 
   function setEdit(id: string, field: keyof CnbEdit, value: string) {
     setEdits((s) => ({ ...s, [id]: { ...s[id], [field]: value as never } }));
@@ -159,7 +165,7 @@ export default function PrebookList({ type, prebook }: { type: PrebookType; preb
                       <td>{p.doctor || "—"}</td>
                       <td>{p.treatment || "—"}</td>
                       <td>
-                        <select value={quality} onChange={(e2) => setEdit(p.id, "quality", e2.target.value)} className="rounded-[6px] border border-border bg-surface px-1.5 py-1 text-[11px]">
+                        <select value={quality} disabled={readOnly} onChange={(e2) => setEdit(p.id, "quality", e2.target.value)} className="rounded-[6px] border border-border bg-surface px-1.5 py-1 text-[11px]">
                           {QUALITIES.map((q) => (
                             <option key={q} value={q}>
                               {q}
@@ -171,6 +177,7 @@ export default function PrebookList({ type, prebook }: { type: PrebookType; preb
                       <td>
                         <textarea
                           rows={2}
+                          disabled={readOnly}
                           defaultValue={e.fcComment ?? p.fcComment ?? ""}
                           onBlur={(e2) => setEdit(p.id, "fcComment", e2.target.value)}
                           className="w-[180px] rounded-[6px] border border-border bg-surface px-2 py-1 text-[11px]"
@@ -179,6 +186,7 @@ export default function PrebookList({ type, prebook }: { type: PrebookType; preb
                       <td>
                         <input
                           type="date"
+                          disabled={readOnly}
                           defaultValue={e.lastConn ?? p.lastConn ?? ""}
                           onChange={(e2) => setEdit(p.id, "lastConn", e2.target.value)}
                           className="rounded-[6px] border border-border bg-surface px-1.5 py-1 text-[11px]"
@@ -187,12 +195,16 @@ export default function PrebookList({ type, prebook }: { type: PrebookType; preb
                       <td>
                         <textarea
                           rows={2}
+                          disabled={readOnly}
                           defaultValue={e.lastComment ?? p.lastComment ?? ""}
                           onBlur={(e2) => setEdit(p.id, "lastComment", e2.target.value)}
                           className="w-[180px] rounded-[6px] border border-border bg-surface px-2 py-1 text-[11px]"
                         />
                       </td>
                       <td>
+                        {readOnly ? (
+                          <span className="text-[10.5px] text-text-soft">View only</span>
+                        ) : (
                         <button
                           type="button"
                           onClick={() => saveRow(p)}
@@ -201,6 +213,7 @@ export default function PrebookList({ type, prebook }: { type: PrebookType; preb
                         >
                           {saveState[p.id] === "saving" ? "Saving…" : "Save"}
                         </button>
+                        )}
                         {saveState[p.id] === "saved" && <div className="mt-1 text-[10.5px] font-semibold text-green">Saved ✓</div>}
                         {saveState[p.id] === "error" && <div className="mt-1 text-[10.5px] font-semibold text-red">Save failed</div>}
                       </td>

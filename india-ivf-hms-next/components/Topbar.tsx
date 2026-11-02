@@ -18,6 +18,7 @@ const ROLE_LABEL: Record<string, string> = {
   fc: "Financial Counsellor",
   accounts: "Accounts Team",
   management: "Management",
+  view_only: "View Only",
 };
 
 interface UserSession {
@@ -46,12 +47,27 @@ export default function Topbar() {
   const [selectedCentre, setSelectedCentre] = useState<number | "">("");
 
   useEffect(() => {
+    let found: UserSession | null = null;
     try {
       const raw = localStorage.getItem("user_session");
-      if (raw) setSession(JSON.parse(raw));
+      if (raw) found = JSON.parse(raw);
     } catch {
       // ignore malformed session
     }
+    if (!found) {
+      // localStorage empty (e.g. cleared) but the sign-in cookie may still be there — restore from it.
+      try {
+        const m = document.cookie.split("; ").find((c) => c.startsWith("user_session="));
+        if (m) {
+          found = JSON.parse(decodeURIComponent(m.slice("user_session=".length)));
+          if (found) localStorage.setItem("user_session", JSON.stringify(found));
+        }
+      } catch {
+        found = null;
+      }
+    }
+    if (found && found.role) setSession(found);
+    else router.replace("/login");
     setSelectedCentre(getCentreOverride() ?? "");
   }, []);
 
@@ -97,8 +113,8 @@ export default function Topbar() {
     router.push("/login");
   }
 
-  const displayName = session?.name || session?.username || "Guest";
-  const roleLabel = session ? ROLE_LABEL[session.role] || session.role : "Not signed in";
+  const displayName = session?.name || session?.username || "";
+  const roleLabel = session ? ROLE_LABEL[session.role] || session.role : "";
   // center_id 0 is the "IndiaIVF" head-office placeholder (unassigned) — treat as unscoped,
   // matching the data-fetch behaviour in lib/auth.ts / lib/clientSession.ts.
   const isScoped = !!session && SCOPED_ROLES.has(session.role) && !!session.centerId;

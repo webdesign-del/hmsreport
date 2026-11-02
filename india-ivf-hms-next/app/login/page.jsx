@@ -218,6 +218,20 @@ const res = await fetch('/api/login/', {
                 </div>
                 <div style={styles.rcArrow}>{loading ? '...' : '→'}</div>
               </button>
+
+              <button 
+                type="button" 
+                disabled={loading}
+                onClick={(e) => handleLogin(e, 'view_only')}
+                style={styles.roleCard}
+              >
+                <div style={{ ...styles.rcIc, backgroundColor: '#f0fdf4', color: '#15803d' }}>👁</div>
+                <div style={styles.rcBody}>
+                  <div style={styles.rcName}>View Only</div>
+                  <div style={styles.rcDesc}>See all data &amp; reports &mdash; no editing</div>
+                </div>
+                <div style={styles.rcArrow}>{loading ? '...' : '→'}</div>
+              </button>
             </div>
           </form>
         </div>

@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, Fragment } from "react";
-import { getClientSession, hidesFinancials } from "@/lib/clientSession";
+import { getClientSession, hidesFinancials, isReadOnlyRole } from "@/lib/clientSession";
 import { localISODate } from "@/lib/format";
 
 interface JourneyViewProps {
@@ -29,11 +29,13 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [hideFinancials, setHideFinancials] = useState(false);
+  const [readOnly, setReadOnly] = useState(false);
   const [hideClinicalForms, setHideClinicalForms] = useState(false);
 
   useEffect(() => {
     const role = getClientSession()?.role;
     setHideFinancials(hidesFinancials(role));
+    setReadOnly(isReadOnlyRole(role));
     // Embryologists work the lab side (Embryology Forms) — clinical/daycare forms aren't theirs.
     setHideClinicalForms(role === "embryologist");
   }, []);
@@ -73,6 +75,89 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
   // procedure's own entry id (not array index), so it stays stable across refetches.
   const [expandedProcKey, setExpandedProcKey] = useState<string | number | null>(null);
 
+  // 🗂 CATEGORY SECTIONS — which category groups are collapsed (Booked Procedures table keys are
+  // the plain category name; the Non-IVF forms section uses a "nonivf:" prefix).
+  const [collapsedCats, setCollapsedCats] = useState<Set<string>>(new Set());
+
+  // ⏱ STAGE DELAY REASONS — when Stimulation / Trigger / OPU runs past its ideal date the
+  // counsellor records why (Financial / Medical / Personal). Saved reasons are keyed by
+  // "<cycle>|<stage>"; the popup only opens for a stage that is actually Delayed.
+  const DELAY_REASONS = ["Financial Problem", "Medical Issues", "Personal Issues"] as const;
+  const [stageDelays, setStageDelays] = useState<Record<string, { reason: string; remarks: string }>>({});
+  const [delayModal, setDelayModal] = useState<{
+    key: string;
+    cycleKey: string;
+    stageKey: string;
+    idealISO: string;
+    actualISO: string | null;
+  } | null>(null);
+  const [delayReason, setDelayReason] = useState<string>("");
+  const [delayRemarks, setDelayRemarks] = useState("");
+  const [delaySaving, setDelaySaving] = useState(false);
+  const [delayError, setDelayError] = useState("");
+
+  const loadStageDelays = async (patientId: string) => {
+    try {
+      const res = await fetch(`/api/stage-delay?patient_id=${encodeURIComponent(patientId)}`, { cache: "no-store" });
+      const json = await res.json();
+      const map: Record<string, { reason: string; remarks: string }> = {};
+      (json.delays || []).forEach((d: any) => {
+        map[`${d.cycle_key}|${d.stage_key}`] = { reason: d.reason, remarks: d.remarks || "" };
+      });
+      setStageDelays(map);
+    } catch {
+      setStageDelays({});
+    }
+  };
+
+  const openDelayModal = (m: NonNullable<typeof delayModal>) => {
+    const saved = stageDelays[m.key];
+    setDelayReason(saved?.reason || "");
+    setDelayRemarks(saved?.remarks || "");
+    setDelayError("");
+    setDelayModal(m);
+  };
+
+  const saveDelayReason = async () => {
+    if (!delayModal) return;
+    if (!delayReason) {
+      setDelayError("Please select a reason.");
+      return;
+    }
+    setDelaySaving(true);
+    setDelayError("");
+    try {
+      const res = await fetch("/api/stage-delay", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          patient_id: patientProfile?.patient_id,
+          cycle_key: delayModal.cycleKey,
+          stage_key: delayModal.stageKey,
+          reason: delayReason,
+          remarks: delayRemarks.trim(),
+          ideal_date: delayModal.idealISO,
+          actual_date: delayModal.actualISO,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.status !== "success") throw new Error(data.message || "Failed to save.");
+      setStageDelays((prev) => ({ ...prev, [delayModal.key]: { reason: delayReason, remarks: delayRemarks.trim() } }));
+      setDelayModal(null);
+    } catch (e: any) {
+      setDelayError(e?.message || "Failed to save.");
+    } finally {
+      setDelaySaving(false);
+    }
+  };
+  const toggleCat = (key: string) =>
+    setCollapsedCats((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+
   // Fetch Patient Details from Django Backend
   const fetchPatientDetails = async (idToFetch: string) => {
     if (!idToFetch || !idToFetch.trim()) return;
@@ -92,6 +177,9 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
 
       if (res.ok && json.status === "success") {
         setPatientProfile(json.data);
+        if (json.data?.patient_id) loadStageDelays(String(json.data.patient_id));
+        // Completed stages (First Consult, Booked, …) always start visible for a freshly loaded patient.
+        setCollapseDone(false);
         const fetchedProcs = json.procedures || [];
         setProcedures(fetchedProcs);
 
@@ -332,6 +420,136 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
           .sort((a, b) => (a.date || "").localeCompare(b.date || ""))
       : [{ label: null as string | null, date: null as string | null, procedures: [] as any[] }];
 
+  // 🗂 CATEGORY-WISE GROUPING (e.g. "IVF with Bed" vs "Non IVF without Bed").
+  // IVF-style categories come first, then the rest in the order they first appear.
+  const catOf = (proc: any) => String(proc.category || "").trim() || "Non IVF without Bed";
+  const orderCategories = (cats: string[]) =>
+    [...cats].sort((a, b) => {
+      const ai = /^ivf/i.test(a) ? 0 : 1;
+      const bi = /^ivf/i.test(b) ? 0 : 1;
+      return ai - bi;
+    });
+  // 📅 IDEAL SCHEDULE — for these stages the ideal date is the cycle's booking date + N days.
+  const IDEAL_OFFSET_DAYS: Record<string, number> = {
+    "ovarian stimulation": 10,
+    trigger: 18,
+    opu: 20,
+  };
+  const idealOffsetFor = (stageKey: string): number | null => {
+    const v = IDEAL_OFFSET_DAYS[String(stageKey || "").trim().toLowerCase()];
+    return v === undefined ? null : v;
+  };
+  // "2025-11-25T16:15:30" + 10  ->  "2025-12-05"  (UTC math, so no timezone/DST drift)
+  const addDaysISO = (iso: string | null | undefined, days: number): string | null => {
+    const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(iso || ""));
+    if (!m) return null;
+    const d = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]) + days));
+    return d.toISOString().slice(0, 10);
+  };
+  // "2026-01-05" -> "05-01-2026"
+  const fmtDMY = (iso: string | null | undefined): string => {
+    const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(iso || ""));
+    return m ? `${m[3]}-${m[2]}-${m[1]}` : String(iso || "");
+  };
+  const todayISO = (() => {
+    const t = new Date();
+    return `${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, "0")}-${String(t.getDate()).padStart(2, "0")}`;
+  })();
+  const fmtProcDate = (iso: string | null | undefined): string => {
+    const m = /^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2})/.exec(String(iso || ""));
+    if (m) return `${fmtDMY(m[1])} ${m[2]}`;
+    return fmtDMY(String(iso || "").slice(0, 10));
+  };
+
+  const sumOf = (list: any[], k: string) => list.reduce((t: number, x: any) => t + (Number(x[k]) || 0), 0);
+
+  const procCategoryMap = new Map<string, { proc: any; idx: number }[]>();
+  visibleProcedures.forEach((proc: any, idx: number) => {
+    const c = catOf(proc);
+    if (!procCategoryMap.has(c)) procCategoryMap.set(c, []);
+    procCategoryMap.get(c)!.push({ proc, idx });
+  });
+  // Flat row list for the Booked Procedures table: one header row per category, then its procedures.
+  const procRows: any[] = [];
+  orderCategories(Array.from(procCategoryMap.keys())).forEach((cat) => {
+    const items = procCategoryMap.get(cat)!;
+    const list = items.map((x) => x.proc);
+    const collapsed = collapsedCats.has(cat);
+    procRows.push({
+      kind: "header",
+      cat,
+      count: items.length,
+      fees: sumOf(list, "fees"),
+      received: sumOf(list, "payment_done"),
+      pending: sumOf(list, "pending"),
+      collapsed,
+    });
+    if (!collapsed) items.forEach((x) => procRows.push({ kind: "proc", proc: x.proc, idx: x.idx }));
+  });
+
+  // Procedures that are NOT part of an IVF cycle flow (they have no stage-by-stage journey),
+  // grouped by category and shown in their own forms/financials section under the stages table.
+  const ivfProcIds = new Set(ivfProcedures.map((x: any) => x.procedure_entry_id ?? x.ID ?? x));
+  const nonIvfProcedures = visibleProcedures.filter(
+    (proc: any) => !ivfProcIds.has(proc.procedure_entry_id ?? proc.ID ?? proc)
+  );
+  const nonIvfCategoryMap = new Map<string, any[]>();
+  nonIvfProcedures.forEach((proc: any) => {
+    const c = catOf(proc);
+    if (!nonIvfCategoryMap.has(c)) nonIvfCategoryMap.set(c, []);
+    nonIvfCategoryMap.get(c)!.push(proc);
+  });
+  const nonIvfCategories = orderCategories(Array.from(nonIvfCategoryMap.keys()));
+
+  // Pill list for a set of forms (used by the Non-IVF section; mirrors the stage-row pills).
+  const renderFormPills = (forms: any[], proc: any, tone: "clinical" | "embryology") => {
+    if (forms.length === 0) {
+      return (
+        <span className="text-text-soft italic text-[11px]">
+          {tone === "clinical" ? "— No clinical form linked" : "— No lab form linked"}
+        </span>
+      );
+    }
+    return (
+      <div className="flex flex-wrap gap-1.5">
+        {forms.map((frm: any, fIdx: number) => {
+          const isFilledInDB = Boolean(frm.is_filled || frm.filled);
+          const formId = frm.form_id || frm.ID || "0";
+          if (!isFormUnlocked(frm, proc)) {
+            return (
+              <span
+                key={fIdx}
+                className="inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-[11px] font-bold shadow-sm bg-slate-200 text-slate-500 border border-slate-300 cursor-not-allowed"
+                title={`Unlocks at ${frm.unlock_percent}% payment`}
+              >
+                <span>🔒</span>
+                <span>{frm.form_name || frm.name}</span>
+              </span>
+            );
+          }
+          return (
+            <a
+              key={fIdx}
+              href={buildFormUrl(proc, formId)}
+              target="_blank"
+              rel="noopener noreferrer"
+              className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-[11px] font-bold shadow-sm transition-transform hover:scale-105 ${
+                isFilledInDB
+                  ? tone === "clinical"
+                    ? "bg-[#2563eb] text-white border border-[#1d4ed8]"
+                    : "bg-[#7c3aed] text-white border border-[#6d28d9]"
+                  : "bg-[#e11d48] text-white border border-[#be123c]"
+              }`}
+            >
+              <span>{isFilledInDB ? "✓" : "✎"}</span>
+              <span>{frm.form_name || frm.name}</span>
+            </a>
+          );
+        })}
+      </div>
+    );
+  };
+
   return (
     <section className="screen-enter max-w-[1700px] mx-auto">
       <div className="mb-6 flex items-center justify-between">
@@ -498,7 +716,36 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
                 </tr>
               </thead>
               <tbody>
-                {visibleProcedures.map((proc, idx) => {
+                {procRows.map((item: any, rowIdx: number) => {
+                  // 🗂 Category header row — click to collapse / expand that category.
+                  if (item.kind === "header") {
+                    return (
+                      <tr
+                        key={`cat-${item.cat}`}
+                        onClick={() => toggleCat(item.cat)}
+                        className="cursor-pointer border-b border-border bg-slate-100 hover:bg-slate-200/70 transition"
+                        title={item.collapsed ? "Click to expand category" : "Click to collapse category"}
+                      >
+                        <td colSpan={hideFinancials ? 6 : 6} className="p-2.5 text-[11px] font-bold uppercase tracking-wide text-slate-700">
+                          <span className={`mr-2 inline-block transition-transform ${item.collapsed ? "" : "rotate-90"}`}>▶</span>
+                          {item.cat}
+                          <span className="ml-2 rounded-full bg-white px-2 py-0.5 text-[10px] font-semibold text-text-soft normal-case">
+                            {item.count} {item.count === 1 ? "procedure" : "procedures"}
+                          </span>
+                        </td>
+                        {!hideFinancials && (
+                          <>
+                            <td className="p-2.5 text-right text-[11px] font-bold text-slate-700">₹ {item.fees.toLocaleString("en-IN")}</td>
+                            <td className="p-2.5 text-right text-[11px] font-bold text-green-600">₹ {item.received.toLocaleString("en-IN")}</td>
+                            <td className={`p-2.5 text-right text-[11px] font-bold ${item.pending > 0 ? "text-red-500" : "text-green-600"}`}>
+                              ₹ {item.pending.toLocaleString("en-IN")}
+                            </td>
+                          </>
+                        )}
+                      </tr>
+                    );
+                  }
+                  const { proc, idx } = item;
                   const procKey = proc.procedure_entry_id ?? proc.ID ?? `${proc.code}-${idx}`;
                   const isExpanded = expandedProcKey === procKey;
                   const colCount = hideFinancials ? 6 : 9;
@@ -740,7 +987,10 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
               collapseDone ? "border-primary bg-primary-soft text-primary-dark" : "border-border text-text-mid"
             }`}
           >
-            ⇕ {collapseDone ? "Show Completed" : "Collapse Completed"}
+            ⇕{" "}
+            {collapseDone
+              ? `Show Completed (${stages.filter((x: any) => x.status === "done").length} hidden)`
+              : "Collapse Completed"}
           </button>
         </div>
       )}
@@ -764,7 +1014,8 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
         <div className="rounded-[14px] border border-border bg-surface shadow-card overflow-hidden">
           <div className="border-b border-border px-5 py-4 flex justify-between items-center bg-surface-2">
             <h3 className="font-bold text-sm">
-              Clinical Journey Stages &amp; Milestones ({stages.length}
+              Clinical Journey Stages &amp; Milestones
+              {ivfProcedures.length > 0 ? ` — ${catOf(ivfProcedures[0])}` : ""} ({stages.length}
               {cycleGroups.length > 1 ? ` × ${cycleGroups.length} cycles` : ""})
             </h3>
             <span className="rounded-full bg-green-soft px-2.5 py-1 text-[10px] font-bold uppercase tracking-wide text-green">
@@ -866,6 +1117,33 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
 
                   const primaryProc = cycleProcedures[0] || {};
 
+                  // Ideal date = this cycle's booking date + the stage's offset (Stimulation +10,
+                  // Trigger +18, OPU +20 days). Only when the cycle actually has a booking date.
+                  const idealOffset = idealOffsetFor(stg.key);
+                  const idealDateForRow = idealOffset !== null ? addDaysISO(cycle.date, idealOffset) : null;
+
+                  // The "Booked" stage date is the day THIS cycle's IVF-with-Bed package was billed
+                  // (not the First Consult date, not an unrelated add-on procedure).
+                  const completedForRow =
+                    stg.key === "Booked" && cycle.date ? fmtProcDate(cycle.date) : stg.completed_date;
+
+                  // Actual date = when the stage really happened (only once it is done). Delayed when
+                  // that date is after the ideal date — or, if not done yet, when today already is.
+                  const stageDone =
+                    stg.status?.toLowerCase() === "done" ||
+                    stg.status?.toLowerCase() === "completed" ||
+                    Boolean(stg.completed_date && stg.completed_date !== "—" && stg.completed_date !== "");
+                  const actualISO = stageDone && /^\d{4}-\d{2}-\d{2}/.test(String(stg.completed_date || ""))
+                    ? String(stg.completed_date).slice(0, 10)
+                    : null;
+                  const isDelayed = idealDateForRow
+                    ? actualISO
+                      ? actualISO > idealDateForRow
+                      : !stageDone && todayISO > idealDateForRow
+                    : false;
+                  const delayKey = `${cycle.label ?? ""}|${stg.key}`;
+                  const savedDelay = stageDelays[delayKey];
+
                   const matchedDonor =
                     donors.find((d) =>
                       stg.key.includes("OPU") || stg.key.includes("Stimulation")
@@ -939,10 +1217,20 @@ return (
       {isDone ? (
         <div className="font-semibold text-emerald-800 flex items-center gap-1">
           <span>📅</span>
-          <span>{stg.completed_date !== "—" ? stg.completed_date : stg.day}</span>
+          <span>{completedForRow !== "—" ? completedForRow : stg.day}</span>
+        </div>
+      ) : idealDateForRow ? (
+        <div className="font-semibold text-slate-700 flex items-center gap-1">
+          <span>📅</span>
+          <span>{fmtDMY(idealDateForRow)}</span>
         </div>
       ) : (
         <div>{stg.day}</div>
+      )}
+      {idealDateForRow && (
+        <div className="text-[10px] text-text-soft">
+          {isDone ? `Ideal: ${fmtDMY(idealDateForRow)} · ` : ""}Booked +{idealOffset} days
+        </div>
       )}
     </div>
   </>
@@ -1031,6 +1319,11 @@ return (
             <code className="bg-amber-50 text-amber-800 px-1.5 py-0.5 rounded text-[10.5px] font-bold">
               {lp.code || "IP64"}
             </code>
+            {/* Each procedure's own billing date sits right beside its code — shown once, on the
+                "Booked" row (where it was booked), not repeated on every later stage. */}
+            {stg.key === "Booked" && lp.on_date && (
+              <span className="ml-2 text-[10.5px] font-semibold text-text-soft">📅 {fmtProcDate(lp.on_date)}</span>
+            )}
           </div>
         ))}
       </div>
@@ -1057,6 +1350,37 @@ return (
             </div>
           </div>
         )}
+
+      {/* ⏱ Actual vs ideal date — Delayed opens the counsellor's reason popup, On Track doesn't. */}
+      {idealDateForRow && (
+        <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[10.5px]">
+          <span className="font-semibold text-text-soft">
+            📅 {actualISO ? fmtDMY(actualISO) : "Actual: pending"}
+          </span>
+          {isDelayed ? (
+            <button
+              type="button"
+              onClick={() =>
+                openDelayModal({
+                  key: delayKey,
+                  cycleKey: String(cycle.label ?? ""),
+                  stageKey: stg.key,
+                  idealISO: idealDateForRow,
+                  actualISO,
+                })
+              }
+              className="inline-flex items-center gap-1 rounded-full border border-red-300 bg-red-100 px-2 py-0.5 text-[10px] font-bold uppercase text-red-700 transition hover:bg-red-200"
+              title={readOnly ? "Delayed — click to view the reason" : "Delayed — click to record the reason"}
+            >
+              ⚠ Delayed{savedDelay ? ` · ${savedDelay.reason}` : ""}
+            </button>
+          ) : (
+            <span className="inline-flex items-center gap-1 rounded-full border border-green-300 bg-green-100 px-2 py-0.5 text-[10px] font-bold uppercase text-green-700">
+              ✓ On Track
+            </span>
+          )}
+        </div>
+      )}
     </div>
   ) : (
     <span className="text-text-soft italic text-[11px]">
@@ -1216,6 +1540,219 @@ return (
         </div>
         );
       })()}
+
+      {/* 🗂 NON-IVF PROCEDURES — category-wise forms & financials.
+          These procedures have no stage-by-stage IVF flow, so each category gets its own
+          section listing every procedure with its linked forms, payment status and consents. */}
+      {patientProfile && !loading && nonIvfProcedures.length > 0 && (() => {
+        const nonIvfColCount =
+          2 + // Procedure + Booked date
+          (!hideClinicalForms && !hiddenTracks.has("clinical_forms") ? 1 : 0) +
+          (!hiddenTracks.has("embryo_forms") ? 1 : 0) +
+          (!hideFinancials && !hiddenTracks.has("financial") ? 1 : 0) +
+          (!hiddenTracks.has("compliances") ? 1 : 0);
+
+        return (
+          <div className="mt-6 rounded-[14px] border border-border bg-surface shadow-card overflow-hidden">
+            <div className="border-b border-border px-5 py-4 flex justify-between items-center bg-surface-2">
+              <h3 className="font-bold text-sm">
+                Other Procedures &amp; Services — by Category ({nonIvfProcedures.length})
+              </h3>
+              <span className="text-[11px] text-text-soft">Not part of an IVF cycle flow</span>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs">
+                <thead className="bg-surface border-b border-border font-semibold text-text-mid">
+                  <tr>
+                    <th className="p-3.5">Procedure</th>
+                    <th className="p-3.5">Booked On</th>
+                    {!hideClinicalForms && !hiddenTracks.has("clinical_forms") && (
+                      <th className="p-3.5 text-blue-700 bg-blue-50/50">Clinical Forms</th>
+                    )}
+                    {!hiddenTracks.has("embryo_forms") && (
+                      <th className="p-3.5 text-purple-700 bg-purple-50/50">Embryology Forms</th>
+                    )}
+                    {!hideFinancials && !hiddenTracks.has("financial") && <th className="p-3.5 text-right">Financials</th>}
+                    {!hiddenTracks.has("compliances") && <th className="p-3.5 text-center">Compliances</th>}
+                  </tr>
+                </thead>
+                <tbody>
+                  {nonIvfCategories.map((cat) => {
+                    const list = nonIvfCategoryMap.get(cat)!;
+                    const key = `nonivf:${cat}`;
+                    const collapsed = collapsedCats.has(key);
+                    return (
+                      <Fragment key={key}>
+                        <tr
+                          onClick={() => toggleCat(key)}
+                          className="cursor-pointer border-b border-border bg-slate-100 hover:bg-slate-200/70 transition"
+                          title={collapsed ? "Click to expand category" : "Click to collapse category"}
+                        >
+                          <td colSpan={nonIvfColCount} className="p-2.5 text-[11px] font-bold uppercase tracking-wide text-slate-700">
+                            <span className={`mr-2 inline-block transition-transform ${collapsed ? "" : "rotate-90"}`}>▶</span>
+                            {cat}
+                            <span className="ml-2 rounded-full bg-white px-2 py-0.5 text-[10px] font-semibold text-text-soft normal-case">
+                              {list.length} {list.length === 1 ? "procedure" : "procedures"}
+                            </span>
+                            {!hideFinancials && (
+                              <span className="ml-3 normal-case font-semibold text-text-mid">
+                                ₹ {sumOf(list, "fees").toLocaleString("en-IN")} billed · ₹{" "}
+                                {sumOf(list, "payment_done").toLocaleString("en-IN")} received ·{" "}
+                                <span className={sumOf(list, "pending") > 0 ? "text-red-500" : "text-green-600"}>
+                                  ₹ {sumOf(list, "pending").toLocaleString("en-IN")} pending
+                                </span>
+                              </span>
+                            )}
+                          </td>
+                        </tr>
+                        {!collapsed &&
+                          list.map((proc: any, pIdx: number) => {
+                            const rawForms: any[] = proc.linked_forms || proc.forms || [];
+                            const clinical = rawForms.filter((f: any) => !isEmbryologyForm(f));
+                            const embryo = rawForms.filter(isEmbryologyForm);
+                            const consents: any[] = proc.linked_concern_forms || [];
+                            const paid = !(proc.pending > 0);
+                            return (
+                              <tr
+                                key={`${key}-${proc.procedure_entry_id ?? proc.ID ?? pIdx}`}
+                                className="border-b border-border-soft hover:bg-surface-2/60 transition align-top"
+                              >
+                                <td className="p-3.5">
+                                  <div className="font-bold text-text">{proc.procedure_name || "—"}</div>
+                                  <span className="mt-1 inline-block rounded bg-amber-100 border border-amber-300 px-2 py-0.5 text-[10.5px] font-bold text-amber-900">
+                                    {proc.code || "—"}
+                                  </span>
+                                </td>
+                                <td className="p-3.5 font-semibold text-slate-600">{proc.on_date || "—"}</td>
+                                {!hideClinicalForms && !hiddenTracks.has("clinical_forms") && (
+                                  <td className="p-3.5 bg-blue-50/20">{renderFormPills(clinical, proc, "clinical")}</td>
+                                )}
+                                {!hiddenTracks.has("embryo_forms") && (
+                                  <td className="p-3.5 bg-purple-50/20">{renderFormPills(embryo, proc, "embryology")}</td>
+                                )}
+                                {!hideFinancials && !hiddenTracks.has("financial") && (
+                                  <td className="p-3.5 text-right">
+                                    <div className="font-bold text-text">₹ {(Number(proc.fees) || 0).toLocaleString("en-IN")}</div>
+                                    <div className={`text-[10.5px] font-semibold ${paid ? "text-green-600" : "text-amber-600"}`}>
+                                      {paid ? "Paid" : `Due ₹ ${(Number(proc.pending) || 0).toLocaleString("en-IN")}`}
+                                    </div>
+                                  </td>
+                                )}
+                                {!hiddenTracks.has("compliances") && (
+                                  <td className="p-3.5 text-center">
+                                    {consents.length > 0 ? (
+                                      <details className="inline-block text-left">
+                                        <summary className="cursor-pointer text-[11px] font-semibold text-blue-700">
+                                          {consents.length} consent form{consents.length === 1 ? "" : "s"}
+                                        </summary>
+                                        <div className="mt-1.5 flex max-w-[360px] flex-wrap gap-1.5">
+                                          {consents.map((cf: any, cfIdx: number) => (
+                                            <a
+                                              key={cf.form_id || cfIdx}
+                                              href={buildFormUrl(proc, cf.form_id, "check_concern_form")}
+                                              target="_blank"
+                                              rel="noopener noreferrer"
+                                              className="inline-flex items-center gap-1 rounded bg-blue-50 border border-blue-200 px-2 py-1 text-[10.5px] font-bold text-blue-800 shadow-sm transition-transform hover:scale-105 hover:bg-blue-100"
+                                              title={cf.form_for || cf.type || ""}
+                                            >
+                                              <span>✎</span>
+                                              <span>{cf.form_name}</span>
+                                            </a>
+                                          ))}
+                                        </div>
+                                      </details>
+                                    ) : (
+                                      <span className="text-text-soft text-[11px]">—</span>
+                                    )}
+                                  </td>
+                                )}
+                              </tr>
+                            );
+                          })}
+                      </Fragment>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* ⏱ DELAY REASON POPUP (counsellor) — only reachable from a Delayed stage badge */}
+      {delayModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+          <div className="w-full max-w-md rounded-2xl bg-white p-6 shadow-2xl">
+            <div className="flex items-start justify-between border-b pb-3 mb-4">
+              <div>
+                <h3 className="text-lg font-bold text-slate-800">Why is this stage delayed?</h3>
+                <p className="mt-0.5 text-xs text-slate-500">
+                  <b>{delayModal.stageKey}</b> · Ideal {fmtDMY(delayModal.idealISO)} ·{" "}
+                  {delayModal.actualISO ? `Actual ${fmtDMY(delayModal.actualISO)}` : "Not done yet"}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setDelayModal(null)}
+                className="text-slate-400 hover:text-slate-600 text-xl font-bold"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="space-y-2">
+              {DELAY_REASONS.map((r) => (
+                <label
+                  key={r}
+                  className={`flex cursor-pointer items-center gap-2.5 rounded-lg border px-3 py-2.5 text-sm font-semibold transition ${
+                    delayReason === r ? "border-primary bg-primary-soft text-primary-dark" : "border-border text-text-mid hover:border-primary"
+                  }`}
+                >
+                  <input
+                    type="radio"
+                    name="delay-reason"
+                    value={r}
+                    checked={delayReason === r}
+                    disabled={readOnly}
+                    onChange={() => setDelayReason(r)}
+                  />
+                  {r}
+                </label>
+              ))}
+            </div>
+
+            <textarea
+              value={delayRemarks}
+              onChange={(e) => setDelayRemarks(e.target.value)}
+              disabled={readOnly}
+              placeholder="Remarks (optional)"
+              rows={3}
+              className="mt-3 w-full rounded-lg border border-border px-3 py-2 text-xs outline-none focus:border-primary"
+            />
+            {delayError && <p className="mt-2 text-xs font-semibold text-red-600">{delayError}</p>}
+
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setDelayModal(null)}
+                className="rounded-lg border border-border px-4 py-2 text-xs font-semibold text-text-mid hover:border-primary"
+              >
+                Cancel
+              </button>
+              {!readOnly && (
+              <button
+                type="button"
+                onClick={saveDelayReason}
+                disabled={delaySaving}
+                className="rounded-lg bg-primary px-4 py-2 text-xs font-semibold text-white hover:bg-primary-dark disabled:opacity-60"
+              >
+                {delaySaving ? "Saving…" : "Save reason"}
+              </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* 💵 PARTIAL PAYMENT LEDGER BREAKDOWN MODAL */}
       {activePaymentModal && (

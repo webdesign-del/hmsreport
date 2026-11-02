@@ -19,6 +19,11 @@ const NO_FINANCIALS_ROLES = new Set(["doctor", "embryologist"]);
 /** Key used for the unscoped-role "view as centre" picker (Topbar), both in localStorage and as a cookie. */
 const CENTRE_OVERRIDE_KEY = "selected_centre_id";
 
+/** "View Only" workspace: can see everything, can change nothing. */
+export function isReadOnlyRole(role?: string | null): boolean {
+  return role === "view_only";
+}
+
 export function hidesFinancials(role?: string | null): boolean {
   return !!role && NO_FINANCIALS_ROLES.has(role);
 }

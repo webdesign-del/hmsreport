@@ -63,7 +63,7 @@ export default async function AgingPage() {
         </TableWrap>
       </Card>
 
-      <AgingPatientList patients={agingPatients} />
+      <AgingPatientList patients={agingPatients} centres={byCentre.map((c) => c.centre)} />
     </section>
   );
 }

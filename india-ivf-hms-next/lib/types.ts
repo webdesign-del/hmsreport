@@ -116,6 +116,16 @@ export interface AgingPatient {
   invoice: string;
   history: string;
   payments: Payment[];
+  /** Aging list: auto status from journey milestones, manual override + reason, switched sales centre */
+  autoStatus?: string;
+  statusOverride?: string;
+  statusReason?: string;
+  salesCentre?: string;
+  /** Cancellation / telecalling workflow state + details */
+  requestState?: string;
+  requestReason?: string;
+  refundAmount?: number | null;
+  requestComment?: string;
 }
 
 export interface Donor {

@@ -20,7 +20,9 @@ async function baseUrl(): Promise<string> {
 
 async function getJSON<T>(path: string): Promise<T> {
   const base = await baseUrl();
-  const res = await fetch(`${base}${path}`, { cache: "no-store" });
+  // Forward the browser's cookies so the sign-in check on /api/* lets this server-side call through.
+  const cookie = (await headers()).get("cookie") ?? "";
+  const res = await fetch(`${base}${path}`, { cache: "no-store", headers: cookie ? { cookie } : {} });
   if (!res.ok) throw new Error(`Failed to fetch ${path}: ${res.status}`);
   return res.json() as Promise<T>;
 }
