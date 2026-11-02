@@ -50,4 +50,9 @@ urlpatterns = [
     path('api/get_red_triggers/', views.get_red_triggers, name='get_red_triggers'),
     path('api/get_dashboard_summary/', views.get_dashboard_summary, name='get_dashboard_summary'),
     path('api/get_stage_patients/', views.get_stage_patients, name='get_stage_patients'),
+    path('api/save_stage_delay/', views.save_stage_delay, name='save_stage_delay'),
+    path('api/get_stage_delays/', views.get_stage_delays, name='get_stage_delays'),
+    path('api/save_aging_action/', views.save_aging_action, name='save_aging_action'),
+    path('api/notify_recipients/', views.notify_recipients, name='notify_recipients'),
+    path('api/mail_settings/', views.mail_settings, name='mail_settings'),
 ]
