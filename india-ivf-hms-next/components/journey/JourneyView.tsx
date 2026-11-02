@@ -140,7 +140,7 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
           setStages([
             { key: "First Consult", day: "Day 1", status: "done" },
             { key: "CNB Visits", day: "Day 2", status: "done" },
-            { key: "Booked", day: "Day 3", status: json.data?.payment_done > 0 ? "done" : "current" },
+            { key: "Booked", day: "Day 3", status: fetchedProcs.some((p: any) => Number(p.payment_done) > 0) ? "done" : "current" },
             { key: "Pre-Procedure", day: "Day 4 - 12", status: "upcoming" },
             { key: "Ovarian Stimulation", day: "Day 13", status: "upcoming" },
             { key: "Endometrial Preparation", day: "Day 14", status: "upcoming" },
@@ -204,6 +204,12 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
   // Thickness) that clutter this list; they're still counted everywhere else
   // (stage linking, payments, etc.), just not shown in this table.
   const HIDDEN_PROCEDURE_CODES = ["IP218", "IP219"];
+
+  // Header totals: the backend only sends per-procedure fees/payment_done/pending, so sum
+  // them here (all booked procedures, including the hidden IP218/IP219 rows).
+  const totalGross = procedures.reduce((sum: number, p: any) => sum + (Number(p.fees) || 0), 0);
+  const totalReceived = procedures.reduce((sum: number, p: any) => sum + (Number(p.payment_done) || 0), 0);
+  const totalPending = procedures.reduce((sum: number, p: any) => sum + (Number(p.pending) || 0), 0);
   const visibleProcedures = procedures.filter(
     (proc: any) => !HIDDEN_PROCEDURE_CODES.includes(String(proc.code || "").trim().toUpperCase())
   );
@@ -436,30 +442,24 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
                 <span className="text-text-soft block text-[11px]">Patient ID</span>
                 <strong className="text-[#8b5cf6] text-sm font-bold">{patientProfile.patient_id}</strong>
               </div>
-              <div>
-                <span className="text-text-soft block text-[11px]">Phone</span>
-                <strong className="text-slate-800">
-                  {patientProfile.patient_phone || patientProfile.wife_phone || "—"}
-                </strong>
-              </div>
               {!hideFinancials && (
                 <>
                   <div>
                     <span className="text-text-soft block text-[11px]">Gross Billed</span>
                     <strong className="text-slate-800 text-sm">
-                      ₹ {patientProfile.fees ? patientProfile.fees.toLocaleString("en-IN") : "0"}
+                      ₹ {totalGross.toLocaleString("en-IN")}
                     </strong>
                   </div>
                   <div>
                     <span className="text-text-soft block text-[11px]">Amount Received</span>
                     <strong className="text-green-600 text-sm">
-                      ₹ {patientProfile.payment_done ? patientProfile.payment_done.toLocaleString("en-IN") : "0"}
+                      ₹ {totalReceived.toLocaleString("en-IN")}
                     </strong>
                   </div>
                   <div>
                     <span className="text-text-soft block text-[11px]">Pending Balance</span>
-                    <strong className={`text-sm ${patientProfile.pending > 0 ? "text-red-500" : "text-green-600"}`}>
-                      ₹ {patientProfile.pending ? patientProfile.pending.toLocaleString("en-IN") : "0"}
+                    <strong className={`text-sm ${totalPending > 0 ? "text-red-500" : "text-green-600"}`}>
+                      ₹ {totalPending.toLocaleString("en-IN")}
                     </strong>
                   </div>
                 </>
@@ -1167,7 +1167,7 @@ return (
                       {!hideFinancials && !hiddenTracks.has("financial") && (
                         <td className="p-3.5 text-right">
                           <div className="font-bold text-text">
-                            ₹ {(primaryProc.fees || patientProfile.fees / stages.length).toLocaleString("en-IN")}
+                            ₹ {(primaryProc.fees || totalGross / stages.length).toLocaleString("en-IN")}
                           </div>
                           <div
                             className={`text-[10.5px] font-semibold ${

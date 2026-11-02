@@ -9,6 +9,9 @@ from django.views.decorators.csrf import csrf_exempt
 from django.utils import timezone
 from django.contrib import messages
 
+# Dashboard lists only show records dated on/after this day (1 April 2024).
+DATA_START_DATE = '2024-04-01'
+
 
 # ============================================================
 # 1. LEGACY HMS_DOCTORS DIRECT AUTHENTICATION & SESSIONS
@@ -368,6 +371,7 @@ def get_dynamic_booked_patients(request):
         WHERE a.paitent_type = 'new_patient'
           AND a.status = 'consultation_done'
           AND p.status IN ('pending', 'approved')
+          AND a.appoitmented_date >= '{DATA_START_DATE}'
           {centre_filter_sql}
         GROUP BY COALESCE(NULLIF(TRIM(a.paitent_id), ''), CAST(a.id AS CHAR))
         ORDER BY MIN(a.appoitmented_date) DESC;
@@ -906,6 +910,7 @@ def get_aging_snapshot(request):
         LEFT JOIN hms_patient_procedure p
             ON p.billing_at = c.center_number
             AND p.remaining_amount > 0
+            AND p.on_date >= '{DATA_START_DATE}'
             AND (p.status IS NULL OR p.status NOT IN ('cancelled', 'disapproved'))
         {by_centre_filter_sql}
         GROUP BY c.center_number, c.center_name
@@ -937,6 +942,7 @@ def get_aging_snapshot(request):
         LEFT JOIN hms_centers c ON p.billing_at = c.center_number
         LEFT JOIN reports_agingfollowup f ON f.invoice = p.receipt_number
         WHERE p.remaining_amount > 0
+          AND p.on_date >= '{DATA_START_DATE}'
           AND (p.status IS NULL OR p.status NOT IN ('cancelled', 'disapproved'))
           {patients_filter_sql}
         ORDER BY p.on_date DESC;
@@ -1059,6 +1065,7 @@ def get_prebook_data(request):
         FROM hms_appointments a
         LEFT JOIN hms_centers c ON a.center = c.center_number
         WHERE a.status = 'booked'
+          AND a.appoitmented_date >= '{DATA_START_DATE}'
           {appt_centre_filter_sql}
         ORDER BY a.appoitmented_date DESC;
     """
@@ -1072,6 +1079,7 @@ def get_prebook_data(request):
         FROM hms_appointments a
         LEFT JOIN hms_centers c ON a.center = c.center_number
         WHERE a.status = 'no_show'
+          AND a.appoitmented_date >= '{DATA_START_DATE}'
           {appt_centre_filter_sql}
         ORDER BY a.appoitmented_date DESC;
     """
@@ -1112,6 +1120,7 @@ def get_prebook_data(request):
                       AND TRIM(bp.patient_id) <> ''
                 )
               )
+          AND hc.on_date >= '{DATA_START_DATE}'
           {cnb_centre_filter_sql}
         ORDER BY hc.on_date DESC;
     """
@@ -1298,6 +1307,83 @@ def _classify_journey_stage(row):
     if withdrawl_done:
         return 2  # withdrawal done, about to start stimulation
     return 0  # Booking
+
+
+@csrf_exempt
+def get_stage_patients(request):
+    """
+    Patient list behind the dashboard "clinical stage" widget (/stage/<idx>). Uses the exact same
+    hms_patient_journey rows and _classify_journey_stage() as get_dashboard_summary, so the
+    per-stage counts here always match the dashboard tiles. Package / net amount come from the
+    patient's live bookings in hms_patient_procedure.
+    """
+    center_id = request.GET.get('center_id')
+    journey_filter_sql = "AND (j.centre_booking = (SELECT center_name FROM hms_centers WHERE center_number = %s) OR j.centre_booking = %s)" if center_id else ""
+    journey_params = [center_id, center_id] if center_id else []
+
+    stage_query = f"""
+        SELECT j.patient_id, j.patients_name,
+               COALESCE(c.center_name, j.centre_booking) AS centre_booking,
+               DATE(j.booking_date) AS booking_date,
+               j.withdrawl_status, j.stimulation_start_status, j.trigger_status, j.opu_status,
+               j.actual_opu_date, j.transfer_date
+        FROM hms_patient_journey j
+        LEFT JOIN hms_centers c ON j.centre_booking REGEXP '^[0-9]+$' AND c.center_number = CAST(j.centre_booking AS UNSIGNED)
+        WHERE j.booking_date IS NOT NULL
+          {journey_filter_sql}
+        ORDER BY j.booking_date DESC;
+    """
+
+    pkg_query = """
+        SELECT patient_id,
+               GROUP_CONCAT(DISTINCT code ORDER BY code SEPARATOR ', ') AS pkg,
+               COALESCE(SUM(fees), 0) AS net
+        FROM hms_patient_procedure
+        WHERE patient_id IS NOT NULL AND TRIM(patient_id) <> ''
+          AND (status IS NULL OR status NOT IN ('cancelled', 'disapproved'))
+        GROUP BY patient_id;
+    """
+
+    def iso(value):
+        if not value:
+            return ""
+        s = value.isoformat() if hasattr(value, "isoformat") else str(value)
+        return "" if s.startswith("0000-00-00") else s
+
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(stage_query, journey_params)
+            columns = [col[0] for col in cursor.description]
+            journey_rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+        with connection.cursor() as cursor:
+            cursor.execute(pkg_query)
+            pkg_by_patient = {
+                str(pid).strip(): (pkg or "", float(net or 0))
+                for pid, pkg, net in cursor.fetchall()
+            }
+
+        patients = []
+        for r in journey_rows:
+            pid = str(r["patient_id"] or "").strip()
+            pkg, net = pkg_by_patient.get(pid, ("", 0.0))
+            patients.append({
+                "id": pid,
+                "name": (r["patients_name"] or "").strip().title(),
+                "centre": r["centre_booking"] or "Unassigned",
+                "signup": iso(r["booking_date"]),
+                "stage": _classify_journey_stage(r),
+                "pkg": pkg,
+                "net": net,
+            })
+
+        response = JsonResponse({"stageLabels": DASHBOARD_STAGE_LABELS, "patients": patients}, safe=False)
+        response["Access-Control-Allow-Origin"] = "*"
+        response["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+        response["Access-Control-Allow-Headers"] = "*"
+        return response
+    except Exception as e:
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
 
 
 @csrf_exempt

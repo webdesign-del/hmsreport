@@ -62,20 +62,25 @@ export default function Sidebar() {
   }
 
   return (
-    <nav
-      className={[
-        "relative flex flex-none flex-col gap-1.5 border-r border-border bg-surface p-[18px_14px] transition-[width] duration-200",
-        collapsed ? "w-[68px] items-center px-[10px]" : "w-[236px]",
-      ].join(" ")}
-    >
+    // Pinned under the 62px top bar, so the sidebar (and its collapse button) stays
+    // on screen while the page scrolls. The button lives on this wrapper, not inside
+    // the nav, because the nav scrolls (overflow) and would clip a button hanging
+    // off its right edge.
+    <div className="sticky top-[62px] z-30 h-[calc(100vh-62px)] flex-none self-start">
       <button
         type="button"
         onClick={toggleCollapsed}
         title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
-        className="absolute -right-3 top-5 flex h-6 w-6 items-center justify-center rounded-full border border-border bg-surface text-[11px] text-text-mid shadow-sm transition-colors hover:border-primary hover:text-primary"
+        className="absolute -right-3 top-5 z-10 flex h-6 w-6 items-center justify-center rounded-full border border-border bg-surface text-[11px] text-text-mid shadow-sm transition-colors hover:border-primary hover:text-primary"
       >
         {collapsed ? "›" : "‹"}
       </button>
+    <nav
+      className={[
+        "flex h-full flex-col gap-1.5 overflow-y-auto overflow-x-hidden border-r border-border bg-surface p-[18px_14px] transition-[width] duration-200",
+        collapsed ? "w-[68px] items-center px-[10px]" : "w-[236px]",
+      ].join(" ")}
+    >
 
       {!collapsed && (
         <div className="px-2.5 pb-2.5 pt-1 font-display text-[11px] font-semibold uppercase tracking-[.07em] text-text-soft">
@@ -131,5 +136,6 @@ export default function Sidebar() {
         </div>
       )}
     </nav>
+    </div>
   );
 }

@@ -45,6 +45,22 @@ export interface AgingSnapshotResponse {
 export const getAgingSnapshot = (centerId?: number | null) =>
   getJSON<AgingSnapshotResponse>(`/api/aging-snapshot${centerId ? `?center_id=${centerId}` : ""}`);
 
+export interface StagePatient {
+  id: string;
+  name: string;
+  centre: string;
+  signup: string;
+  stage: number;
+  pkg: string;
+  net: number;
+}
+export interface StagePatientsResponse {
+  stageLabels: string[];
+  patients: StagePatient[];
+}
+export const getStagePatients = (centerId?: number | null) =>
+  getJSON<StagePatientsResponse>(`/api/stage-patients${centerId ? `?center_id=${centerId}` : ""}`);
+
 export interface DashboardSummaryResponse {
   kpi: {
     today: { exp: number; act: number; redTriggers: number; approvalsPending: number };

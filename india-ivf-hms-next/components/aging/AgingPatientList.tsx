@@ -45,6 +45,18 @@ export default function AgingPatientList({ patients }: { patients: AgingPatient[
   const [to, setTo] = useState(TODAY);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(50);
+  // Booking / Sales Reporting / Billing centre are usually the same value — collapsed by default
+  // into a single "Centre" column; the toggle in the header expands all three.
+  const [centresOpen, setCentresOpen] = useState(false);
+  // The 24 monthly collection columns are grouped by financial year (12 months each).
+  // Each FY is collapsed by default into one total column; click its header to expand months.
+  const FY_GROUPS = [
+    { label: "FY 25-26", months: FY_MONTHS.slice(0, 12), labels: FY_LABELS.slice(0, 12) },
+    { label: "FY 26-27", months: FY_MONTHS.slice(12, 24), labels: FY_LABELS.slice(12, 24) },
+  ];
+  const [fyOpen, setFyOpen] = useState<boolean[]>([false, false]);
+  const toggleFy = (i: number) => setFyOpen((o) => o.map((v, j) => (j === i ? !v : v)));
+  const fyColCount = FY_GROUPS.reduce((n, g, i) => n + (fyOpen[i] ? g.months.length : 1), 0);
 
   const [followUpTarget, setFollowUpTarget] = useState<AgingPatient | null>(null);
   const [followUpStatus, setFollowUpStatus] = useState<string>(FOLLOWUP_STATUSES[0]);
@@ -186,7 +198,11 @@ export default function AgingPatientList({ patients }: { patients: AgingPatient[
         </div>
       </div>
 
-      <div className="scroll-thin overflow-x-auto border-t border-border-soft">
+      {/* The table scrolls inside this box (both ways), so the header row can stay pinned at the
+          top while rows scroll. Tailwind utilities beat the .tbl component styles, so the th rules
+          below override the plain header cells; the Date / IIC ID / Patient Name headers keep a
+          higher z-index so they stay on top of the other headers at the top-left corner. */}
+      <div className="scroll-thin max-h-[calc(100vh-150px)] overflow-auto border-t border-border-soft [&_thead_th]:sticky [&_thead_th]:top-0 [&_thead_th]:z-[3] [&_thead_th.sticky-l]:z-[5] [&_thead_th.sticky-l2]:z-[5] [&_thead_th.sticky-l3]:z-[5]">
         <table className="tbl">
           <thead>
             <tr>
@@ -198,9 +214,21 @@ export default function AgingPatientList({ patients }: { patients: AgingPatient[
               <th>FY</th>
               <th>Pkg Code</th>
               <th>Pkg Description</th>
-              <th>Booking Centre</th>
-              <th>Sales Reporting Centre</th>
-              <th>Billing Centre</th>
+              <th>
+                <button
+                  type="button"
+                  onClick={() => setCentresOpen((o) => !o)}
+                  title={centresOpen ? "Collapse centre columns" : "Expand centre columns"}
+                  className="inline-flex items-center gap-1.5 font-[inherit] uppercase tracking-[inherit] text-inherit hover:text-primary"
+                >
+                  <span className="flex h-4 w-4 items-center justify-center rounded border border-border bg-surface text-[10px] leading-none">
+                    {centresOpen ? "‹" : "›"}
+                  </span>
+                  {centresOpen ? "Booking Centre" : "Centre"}
+                </button>
+              </th>
+              {centresOpen && <th>Sales Reporting Centre</th>}
+              {centresOpen && <th>Billing Centre</th>}
               <th>Document Type</th>
               <th>Invoice No</th>
               <th className="col-num">Gross Revenue Pkg</th>
@@ -209,11 +237,39 @@ export default function AgingPatientList({ patients }: { patients: AgingPatient[
               <th className="col-num">Booked Pkg Inc GST</th>
               <th className="col-num">GST</th>
               <th className="col-num">Booked Pkg Ex GST</th>
-              {FY_LABELS.map((l) => (
-                <th className="col-num" key={l}>
-                  {l}
-                </th>
-              ))}
+              {FY_GROUPS.map((g, gi) =>
+                fyOpen[gi] ? (
+                  g.labels.map((l, li) => (
+                    <th className="col-num" key={`${g.label}-${l}`}>
+                      {li === 0 ? (
+                        <button
+                          type="button"
+                          onClick={() => toggleFy(gi)}
+                          title={`Collapse ${g.label}`}
+                          className="inline-flex items-center gap-1.5 font-[inherit] uppercase tracking-[inherit] text-inherit hover:text-primary"
+                        >
+                          <span className="flex h-4 w-4 items-center justify-center rounded border border-border bg-surface text-[10px] leading-none">‹</span>
+                          {l}
+                        </button>
+                      ) : (
+                        l
+                      )}
+                    </th>
+                  ))
+                ) : (
+                  <th className="col-num" key={g.label}>
+                    <button
+                      type="button"
+                      onClick={() => toggleFy(gi)}
+                      title={`Expand ${g.label} months`}
+                      className="inline-flex items-center gap-1.5 font-[inherit] uppercase tracking-[inherit] text-inherit hover:text-primary"
+                    >
+                      <span className="flex h-4 w-4 items-center justify-center rounded border border-border bg-surface text-[10px] leading-none">›</span>
+                      {g.label}
+                    </button>
+                  </th>
+                )
+              )}
               <th className="col-num">Total Collection</th>
               <th className="col-num">Balance FY 26-27</th>
               <th className="col-num">Total Outstanding</th>
@@ -227,7 +283,7 @@ export default function AgingPatientList({ patients }: { patients: AgingPatient[
           <tbody>
             {filtered.length === 0 && (
               <tr>
-                <td colSpan={51} className="text-center text-text-soft">
+                <td colSpan={24 + (centresOpen ? 3 : 1) + fyColCount} className="text-center text-text-soft">
                   No records match the current filters.
                 </td>
               </tr>
@@ -260,8 +316,8 @@ export default function AgingPatientList({ patients }: { patients: AgingPatient[
                   <td>{p.pkg}</td>
                   <td>{p.desc}</td>
                   <td>{p.centre}</td>
-                  <td>{p.centre}</td>
-                  <td>{p.centre}</td>
+                  {centresOpen && <td>{p.centre}</td>}
+                  {centresOpen && <td>{p.centre}</td>}
                   <td>Tax Invoice</td>
                   <td>{p.invoice}</td>
                   <td className="col-num">{fmtINR(p.gross)}</td>
@@ -270,14 +326,27 @@ export default function AgingPatientList({ patients }: { patients: AgingPatient[
                   <td className="col-num">{fmtINR(p.incGst)}</td>
                   <td className="col-num">{fmtINR(gst)}</td>
                   <td className="col-num">{fmtINR(exGst)}</td>
-                  {FY_MONTHS.map((ym) => {
-                    const amt = paymentInMonth(p, ym);
-                    return (
-                      <td className="col-num" key={ym}>
-                        {amt ? fmtINR(amt) : "·"}
-                      </td>
-                    );
-                  })}
+                  {FY_GROUPS.map((g, gi) =>
+                    fyOpen[gi] ? (
+                      g.months.map((ym) => {
+                        const amt = paymentInMonth(p, ym);
+                        return (
+                          <td className="col-num" key={ym}>
+                            {amt ? fmtINR(amt) : "·"}
+                          </td>
+                        );
+                      })
+                    ) : (
+                      (() => {
+                        const sum = g.months.reduce((t, ym) => t + paymentInMonth(p, ym), 0);
+                        return (
+                          <td className="col-num" key={g.label}>
+                            {sum ? fmtINR(sum) : "·"}
+                          </td>
+                        );
+                      })()
+                    )
+                  )}
                   <td className="col-num strong">{fmtINR(totalColl)}</td>
                   <td className="col-num">{balFy2627 ? fmtINR(balFy2627) : "·"}</td>
                   <td className="col-num strong" style={{ color: "var(--color-red)" }}>

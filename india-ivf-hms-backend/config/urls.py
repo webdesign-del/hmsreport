@@ -49,4 +49,5 @@ urlpatterns = [
     path('api/get_prebook_data/', views.get_prebook_data, name='get_prebook_data'),
     path('api/get_red_triggers/', views.get_red_triggers, name='get_red_triggers'),
     path('api/get_dashboard_summary/', views.get_dashboard_summary, name='get_dashboard_summary'),
+    path('api/get_stage_patients/', views.get_stage_patients, name='get_stage_patients'),
 ]
