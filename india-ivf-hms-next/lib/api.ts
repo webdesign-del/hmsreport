@@ -23,7 +23,13 @@ async function getJSON<T>(path: string): Promise<T> {
   // Forward the browser's cookies so the sign-in check on /api/* lets this server-side call through.
   const cookie = (await headers()).get("cookie") ?? "";
   const res = await fetch(`${base}${path}`, { cache: "no-store", headers: cookie ? { cookie } : {} });
-  if (!res.ok) throw new Error(`Failed to fetch ${path}: ${res.status}`);
+  if (!res.ok) {
+    // Shows in the Next.js log (pm2 logs) so a failing server-side call can be traced.
+    console.error(
+      `[getJSON] ${path} -> ${res.status} | url=${base}${path} | cookie sent=${cookie ? `yes (${cookie.length} chars, user_session=${cookie.includes("user_session=")})` : "NO"}`
+    );
+    throw new Error(`Failed to fetch ${path}: ${res.status}`);
+  }
   return res.json() as Promise<T>;
 }
 
