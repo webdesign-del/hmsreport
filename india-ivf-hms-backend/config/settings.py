@@ -84,10 +84,10 @@ WSGI_APPLICATION = 'config.wsgi.application'
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.mysql',
-        'NAME': os.environ.get('DB_NAME', 'hmsindiaivf'),     # PHP Database Name
-        'USER': os.environ.get('DB_USER', 'hmsindiaivf'),
-        'PASSWORD': os.environ.get('DB_PASSWORD', 'Hmsindia@$#2026'),         
-        'HOST': '127.0.0.1',     
+        'NAME': 'hmsindiaivf',     # PHP Database Name
+        'USER': 'hmsindiaivf',          
+        'PASSWORD': 'Hmsindia@$#2026',          
+        'HOST': '139.84.175.88',     
         'PORT': '3306',
         'OPTIONS': {
             'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",

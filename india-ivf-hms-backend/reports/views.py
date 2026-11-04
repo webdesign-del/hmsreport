@@ -32,6 +32,38 @@ EMPLOYEE_WORKSPACE_ROLES = {
 }
 
 
+def _pw_ok(stored, plain):
+    """Match a stored password against what was typed: plain text, MD5 / SHA-1 / SHA-256 hex, or a Django / bcrypt hash."""
+    stored = (stored or '').strip()
+    if not stored:
+        return False
+    if stored == plain:
+        return True
+    raw = plain.encode('utf-8')
+    low = stored.lower()
+    if len(low) == 32 and low == hashlib.md5(raw).hexdigest():
+        return True
+    if len(low) == 40 and low == hashlib.sha1(raw).hexdigest():
+        return True
+    if len(low) == 64 and low == hashlib.sha256(raw).hexdigest():
+        return True
+    if stored.startswith('$'):
+        try:
+            import bcrypt
+            if bcrypt.checkpw(raw, stored.replace('$2y$', '$2b$', 1).encode('utf-8')):
+                return True
+        except Exception:
+            pass
+    if '$' in stored:
+        try:
+            from django.contrib.auth.hashers import check_password
+            if check_password(plain, stored):
+                return True
+        except Exception:
+            pass
+    return False
+
+
 @csrf_exempt
 def login_view(request):
     if request.method == "POST":
@@ -51,6 +83,8 @@ def login_view(request):
             password_input = request.POST.get('password')
             role_input = request.POST.get('role')
 
+        username_input = (username_input or '').strip()
+        password_input = password_input or ''
         if not username_input or not password_input:
             return JsonResponse({'status': 'error', 'message': 'Username and password are required.'}, status=400)
 
@@ -67,17 +101,18 @@ def login_view(request):
                 SELECT e.id, e.name, e.email, e.username, e.password, e.role, e.status, e.center_id, c.center_name
                 FROM hms_employees e
                 LEFT JOIN hms_centers c ON e.center_id = c.center_number
-                WHERE (e.username = %s OR e.email = %s) AND LOWER(TRIM(e.role)) IN ({role_marks})
+                WHERE (LOWER(TRIM(e.username)) = LOWER(%s) OR LOWER(TRIM(e.email)) = LOWER(%s))
+                  AND (LOWER(TRIM(e.role)) IN ({role_marks}) OR LOWER(TRIM(e.other_role)) IN ({role_marks}))
                 LIMIT 1;
             """
             with connection.cursor() as cursor:
-                cursor.execute(employee_query, [username_input, username_input] + expected_roles)
+                cursor.execute(employee_query, [username_input, username_input] + expected_roles + expected_roles)
                 employee_row = cursor.fetchone()
 
             if employee_row:
                 emp_id, emp_name, emp_email, emp_username, emp_password, emp_role, emp_status, emp_center_id, emp_center_name = employee_row
 
-                if emp_password == password_md5 or emp_password == password_input:
+                if _pw_ok(emp_password, password_input):
                     if not emp_status:
                         return JsonResponse({'status': 'error', 'message': 'This account has been deactivated.'}, status=403)
 
@@ -105,10 +140,19 @@ def login_view(request):
             # Diagnostic: right password but the account's DB role isn't allowed in this workspace.
             with connection.cursor() as cursor:
                 cursor.execute(
-                    "SELECT role, password FROM hms_employees WHERE (username = %s OR email = %s) LIMIT 1",
+                    "SELECT role, password, status FROM hms_employees "
+                    "WHERE (LOWER(TRIM(username)) = LOWER(%s) OR LOWER(TRIM(email)) = LOWER(%s)) LIMIT 1",
                     [username_input, username_input])
                 other = cursor.fetchone()
-            if other and (other[1] == password_md5 or other[1] == password_input):
+            # Server-side hint (shown in the Django terminal only — never sent to the browser).
+            if not employee_row:
+                print(f"[login] workspace={role_input!r} user={username_input!r}: "
+                      + ("no account with that username/email" if not other
+                         else f"account found but its role is {other[0]!r} (allowed here: {expected_roles}); "
+                              f"password {'matches' if _pw_ok(other[1], password_input) else 'does NOT match'}"))
+            else:
+                print(f"[login] workspace={role_input!r} user={username_input!r}: account found, password does NOT match")
+            if other and _pw_ok(other[1], password_input):
                 return JsonResponse({
                     'status': 'error',
                     'message': f"This account's role is '{other[0]}', which is not allowed in this workspace. Pick the matching workspace.",
@@ -872,6 +916,10 @@ def ensure_aging_followup_table():
                 UNIQUE KEY uniq_invoice (invoice)
             )
         """)
+        for col, ddl in (('next_followup_date', 'DATE NULL'), ('next_followup_set_at', 'DATETIME NULL')):
+            cursor.execute("SHOW COLUMNS FROM reports_agingfollowup LIKE %s", [col])
+            if not cursor.fetchone():
+                cursor.execute(f"ALTER TABLE reports_agingfollowup ADD COLUMN {col} {ddl}")
 
 
 @csrf_exempt
@@ -894,9 +942,24 @@ def save_aging_followup(request):
         ensure_aging_followup_table()
 
         current_now = timezone.now()
-        referred_date = current_now.date() if new_status == 'Revert to Telecaller team' else None
+        followup_only = bool(data.get('followup_only'))
+        if followup_only and not remarks:
+            return JsonResponse({'status': 'error', 'message': 'Please write the follow-up remarks.'}, status=400)
+        next_date = None
+        if followup_only:
+            try:
+                next_date = _dt_log.strptime(str(data.get('next_date') or '').strip(), '%Y-%m-%d').date()
+            except ValueError:
+                return JsonResponse({'status': 'error', 'message': 'Select the next follow-up date.'}, status=400)
+            if next_date < timezone.localdate():
+                return JsonResponse({'status': 'error', 'message': 'The next follow-up date cannot be in the past.'}, status=400)
+        # A plain follow-up note never changes the status or the "referred to tele" date.
+        referred_date = None if followup_only else (current_now.date() if new_status == 'Revert to Telecaller team' else None)
         log_user = str(data.get('user') or '').strip()
-        log_line = _fmt_log(log_user, f"{new_status}: {remarks}" if remarks else new_status)
+        if followup_only:
+            log_line = _fmt_log(log_user, f"Follow-up: {remarks} — Next follow-up: {next_date.strftime('%d-%b-%y')}")
+        else:
+            log_line = _fmt_log(log_user, f"{new_status}: {remarks}" if remarks else new_status)
 
         with connection.cursor() as cursor:
             cursor.execute("SELECT id, history_log, referred_date FROM reports_agingfollowup WHERE invoice = %s", [invoice])
@@ -906,18 +969,31 @@ def save_aging_followup(request):
                 existing_id, existing_history, existing_referred = row
                 new_history = f"{existing_history}\n{log_line}" if existing_history else log_line
                 final_referred = referred_date or existing_referred
-                cursor.execute("""
-                    UPDATE reports_agingfollowup
-                    SET status = %s, remarks = %s, referred_date = %s, history_log = %s, updated_at = %s
-                    WHERE id = %s
-                """, [new_status, remarks, final_referred, new_history, current_now, existing_id])
+                if followup_only:
+                    cursor.execute("""
+                        UPDATE reports_agingfollowup
+                        SET remarks = %s, history_log = %s, updated_at = %s
+                        WHERE id = %s
+                    """, [remarks, new_history, current_now, existing_id])
+                else:
+                    cursor.execute("""
+                        UPDATE reports_agingfollowup
+                        SET status = %s, remarks = %s, referred_date = %s, history_log = %s, updated_at = %s
+                        WHERE id = %s
+                    """, [new_status, remarks, final_referred, new_history, current_now, existing_id])
             else:
                 cursor.execute("""
                     INSERT INTO reports_agingfollowup (invoice, patient_id, status, remarks, referred_date, history_log, created_at, updated_at)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 """, [invoice, patient_id, new_status, remarks, referred_date, log_line, current_now, current_now])
 
-        return JsonResponse({'status': 'success', 'message': 'Follow-up saved.', 'logLine': log_line})
+        if next_date:
+            with connection.cursor() as cursor:
+                cursor.execute("UPDATE reports_agingfollowup SET next_followup_date = %s, next_followup_set_at = NOW() WHERE invoice = %s",
+                               [next_date, invoice])
+        _push_notif(invoice, patient_id, log_line)
+        return JsonResponse({'status': 'success', 'message': 'Follow-up saved.', 'logLine': log_line,
+                             'nextFu': next_date.isoformat() if next_date else ''})
     except Exception as e:
         return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
 
@@ -926,7 +1002,7 @@ def save_aging_followup(request):
 # 7b. STAGE DELAY REASONS (Clinical Journey: Stimulation / Trigger / OPU running late)
 # ============================================================
 
-STAGE_DELAY_REASONS = ['Financial Problem', 'Medical Issues', 'Personal Issues']
+STAGE_DELAY_REASONS = ['Financial Problem', 'Medical Issues', 'Personal Issues', 'Other']
 
 
 def ensure_stage_delay_table():
@@ -945,6 +1021,18 @@ def ensure_stage_delay_table():
                 UNIQUE KEY uniq_patient_cycle_stage (patient_id, cycle_key, stage_key)
             )
         """)
+        cursor.execute("SHOW COLUMNS FROM reports_stagedelay")
+        have = {r[0] for r in cursor.fetchall()}
+        for col, ddl in [
+            ('admin_reply', 'TEXT NULL'),
+            ('replied_by', "VARCHAR(150) NOT NULL DEFAULT ''"),
+            ('replied_at', 'DATETIME NULL'),
+            ('requested_by', "VARCHAR(150) NOT NULL DEFAULT ''"),
+            ('requester_email', "VARCHAR(190) NOT NULL DEFAULT ''"),
+            ('patient_name', "VARCHAR(255) NOT NULL DEFAULT ''"),
+        ]:
+            if col not in have:
+                cursor.execute(f"ALTER TABLE reports_stagedelay ADD COLUMN {col} {ddl}")
 
 
 @csrf_exempt
@@ -956,25 +1044,60 @@ def save_stage_delay(request):
         patient_id = str(data.get('patient_id') or '').strip()
         cycle_key = str(data.get('cycle_key') or '').strip()[:255]
         stage_key = str(data.get('stage_key') or '').strip()
+        log_user = str(data.get('user') or '').strip()
+        user_role = str(data.get('role') or '').strip()
+
+        # Administrator (Management) replying to a recorded delay reason
+        if str(data.get('op') or '') == 'reply':
+            if user_role not in ('management', 'superadmin'):
+                return JsonResponse({'status': 'error', 'message': 'Only the Administrator can reply.'}, status=403)
+            reply = str(data.get('reply') or '').strip()
+            if not patient_id or not stage_key or not reply:
+                return JsonResponse({'status': 'error', 'message': 'Please write your reply.'}, status=400)
+            ok, msg, mail = _save_delay_reply(patient_id, cycle_key, stage_key, reply, log_user or 'Administrator')
+            if not ok:
+                return JsonResponse({'status': 'error', 'message': msg}, status=400)
+            return JsonResponse({'status': 'success', 'message': msg, 'mail': mail, 'reply': reply,
+                                 'repliedBy': log_user or 'Administrator'})
+
         reason = str(data.get('reason') or '').strip()
         remarks = str(data.get('remarks') or '').strip()
         ideal_date = str(data.get('ideal_date') or '').strip()[:10] or None
         actual_date = str(data.get('actual_date') or '').strip()[:10] or None
+        req_email = str(data.get('requester_email') or '').strip().lower()
+        if '@' not in req_email:
+            req_email = ''
+        patient_name = str(data.get('patient_name') or '').strip()[:255]
 
+        if user_role == 'view_only':
+            return JsonResponse({'status': 'error', 'message': 'View-only access — you cannot make changes.'}, status=403)
         if not patient_id or not stage_key or not reason:
             return JsonResponse({'status': 'error', 'message': 'patient_id, stage_key and reason are required.'}, status=400)
         if reason not in STAGE_DELAY_REASONS:
             return JsonResponse({'status': 'error', 'message': 'Unrecognized reason.'}, status=400)
+        if reason == 'Other' and not remarks:
+            return JsonResponse({'status': 'error', 'message': 'Please describe the reason in the remarks.'}, status=400)
 
         ensure_stage_delay_table()
         with connection.cursor() as cursor:
+            cursor.execute("SELECT reason, remarks FROM reports_stagedelay WHERE patient_id = %s AND cycle_key = %s AND stage_key = %s",
+                           [patient_id, cycle_key, stage_key])
+            existing = cursor.fetchone()
             cursor.execute("""
-                INSERT INTO reports_stagedelay (patient_id, cycle_key, stage_key, reason, remarks, ideal_date, actual_date)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO reports_stagedelay (patient_id, cycle_key, stage_key, reason, remarks, ideal_date, actual_date,
+                                                requested_by, requester_email, patient_name)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE reason = VALUES(reason), remarks = VALUES(remarks),
-                                        ideal_date = VALUES(ideal_date), actual_date = VALUES(actual_date)
-            """, [patient_id, cycle_key, stage_key, reason, remarks, ideal_date, actual_date])
-        return JsonResponse({'status': 'success', 'message': 'Delay reason saved.'})
+                                        ideal_date = VALUES(ideal_date), actual_date = VALUES(actual_date),
+                                        requested_by = VALUES(requested_by), requester_email = VALUES(requester_email),
+                                        patient_name = IF(VALUES(patient_name) = '', patient_name, VALUES(patient_name))
+            """, [patient_id, cycle_key, stage_key, reason, remarks, ideal_date, actual_date, log_user[:150], req_email[:190], patient_name])
+        resp = {'status': 'success', 'message': 'Delay reason saved.'}
+        changed = (not existing) or existing[0] != reason or (existing[1] or '') != remarks
+        if changed:
+            info = _delay_row(patient_id, cycle_key, stage_key)
+            resp['mail'] = _send_delay_mail(request, data, info)
+        return JsonResponse(resp)
     except Exception as e:
         return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
 
@@ -988,12 +1111,14 @@ def get_stage_delays(request):
         ensure_stage_delay_table()
         with connection.cursor() as cursor:
             cursor.execute("""
-                SELECT cycle_key, stage_key, reason, remarks
+                SELECT cycle_key, stage_key, reason, remarks, admin_reply, replied_by, replied_at, requested_by
                 FROM reports_stagedelay
                 WHERE patient_id = %s
             """, [patient_id])
             delays = [
-                {'cycle_key': r[0] or '', 'stage_key': r[1], 'reason': r[2], 'remarks': r[3] or ''}
+                {'cycle_key': r[0] or '', 'stage_key': r[1], 'reason': r[2], 'remarks': r[3] or '',
+                 'reply': r[4] or '', 'replied_by': r[5] or '',
+                 'replied_at': r[6].strftime('%d-%b-%y %I:%M %p') if r[6] else '', 'requested_by': r[7] or ''}
                 for r in cursor.fetchall()
             ]
         return JsonResponse({'status': 'success', 'delays': delays})
@@ -1047,6 +1172,36 @@ def ensure_aging_action_tables():
                 comment TEXT,
                 updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                 UNIQUE KEY uniq_invoice (invoice)
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS reports_centrechange (
+                invoice VARCHAR(100) NOT NULL PRIMARY KEY,
+                patient_id VARCHAR(50) NOT NULL,
+                from_centre VARCHAR(255) NOT NULL DEFAULT '',
+                to_centre VARCHAR(255) NOT NULL DEFAULT '',
+                reason VARCHAR(500) NOT NULL DEFAULT '',
+                state VARCHAR(20) NOT NULL DEFAULT '',
+                requested_by VARCHAR(150) NOT NULL DEFAULT '',
+                decided_by VARCHAR(150) NOT NULL DEFAULT '',
+                decision_comment VARCHAR(500) NOT NULL DEFAULT '',
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS reports_cancelrequest (
+                invoice VARCHAR(100) NOT NULL PRIMARY KEY,
+                patient_id VARCHAR(50) NOT NULL DEFAULT '',
+                patient_name VARCHAR(255) NOT NULL DEFAULT '',
+                centre VARCHAR(255) NOT NULL DEFAULT '',
+                pkg VARCHAR(255) NOT NULL DEFAULT '',
+                outstanding DECIMAL(14,2) NOT NULL DEFAULT 0,
+                collected DECIMAL(14,2) NOT NULL DEFAULT 0,
+                reason VARCHAR(255) NOT NULL DEFAULT '',
+                remarks VARCHAR(500) NOT NULL DEFAULT '',
+                requested_by VARCHAR(150) NOT NULL DEFAULT '',
+                requester_email VARCHAR(190) NOT NULL DEFAULT '',
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
             )
         """)
         cursor.execute("""
@@ -1158,6 +1313,47 @@ def _history_text(*sources):
 
 
 # ---- SMTP settings editable from the frontend (stored in DB, no .env edit / restart needed) ----
+
+# ---- SMTP connection with a reliable CA bundle (fixes "CERTIFICATE_VERIFY_FAILED" on machines whose Python has no CA certs) ----
+import ssl as _ssl
+from django.core.mail.backends.smtp import EmailBackend as _DjangoSMTPBackend
+from django.utils.functional import cached_property as _cached_property
+
+
+class _VerifiedSMTPBackend(_DjangoSMTPBackend):
+    """SMTP backend that verifies the server certificate against the 'certifi' bundle (plus the system store)."""
+    @_cached_property
+    def ssl_context(self):
+        ctx = _ssl.create_default_context()
+        try:
+            import certifi
+            ctx.load_verify_locations(cafile=certifi.where())
+        except Exception:
+            pass
+        return ctx
+
+
+class _UnverifiedSMTPBackend(_DjangoSMTPBackend):
+    """Encrypted but WITHOUT certificate checking — only for networks that intercept TLS."""
+    @_cached_property
+    def ssl_context(self):
+        ctx = _ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = _ssl.CERT_NONE
+        return ctx
+
+
+def _smtp_connection(cfg):
+    from django.core.mail import get_connection
+    backend = _UnverifiedSMTPBackend if not cfg.get('verify_ssl', True) else _VerifiedSMTPBackend
+    use_ssl = int(cfg['port']) == 465            # implicit-SSL port
+    return get_connection(
+        backend=f"{backend.__module__}.{backend.__name__}",
+        host=cfg['host'], port=cfg['port'], username=cfg['user'], password=cfg['password'],
+        use_tls=(cfg['use_tls'] and not use_ssl), use_ssl=use_ssl, timeout=20, fail_silently=False,
+    )
+
+
 def ensure_mail_config_table():
     with connection.cursor() as cursor:
         cursor.execute("""
@@ -1184,6 +1380,7 @@ def _load_mail_config():
             'host': cfg.get('host', ''),
             'port': int(cfg.get('port') or 587),
             'use_tls': (cfg.get('use_tls', '1') == '1'),
+            'verify_ssl': (cfg.get('verify_ssl', '1') == '1'),
             'user': cfg.get('user', ''),
             'password': cfg.get('password', ''),
             'from_email': cfg.get('from_email') or cfg.get('user', ''),
@@ -1194,11 +1391,12 @@ def _load_mail_config():
             'host': getattr(dj_settings, 'EMAIL_HOST', ''),
             'port': int(getattr(dj_settings, 'EMAIL_PORT', 587) or 587),
             'use_tls': bool(getattr(dj_settings, 'EMAIL_USE_TLS', True)),
+            'verify_ssl': True,
             'user': getattr(dj_settings, 'EMAIL_HOST_USER', ''),
             'password': getattr(dj_settings, 'EMAIL_HOST_PASSWORD', ''),
             'from_email': dj_settings.DEFAULT_FROM_EMAIL,
         }
-    return {'source': 'none', 'host': '', 'port': 587, 'use_tls': True, 'user': '', 'password': '', 'from_email': dj_settings.DEFAULT_FROM_EMAIL}
+    return {'source': 'none', 'host': '', 'port': 587, 'use_tls': True, 'verify_ssl': True, 'user': '', 'password': '', 'from_email': dj_settings.DEFAULT_FROM_EMAIL}
 
 
 @csrf_exempt
@@ -1225,6 +1423,7 @@ def mail_settings(request):
                 if from_email and '@' not in from_email:
                     return JsonResponse({'status': 'error', 'message': 'Enter a valid From email.'}, status=400)
                 pairs = {'host': host, 'port': str(port), 'use_tls': '1' if data.get('useTls', True) else '0',
+                         'verify_ssl': '1' if data.get('verifySsl', True) else '0',
                          'user': user, 'from_email': from_email}
                 if password:                      # blank = keep the saved password
                     pairs['password'] = password
@@ -1235,14 +1434,33 @@ def mail_settings(request):
         cfg = _load_mail_config()
         return JsonResponse({
             'status': 'success', 'source': cfg['source'], 'host': cfg['host'], 'port': cfg['port'],
-            'useTls': cfg['use_tls'], 'user': cfg['user'], 'fromEmail': cfg['from_email'],
+            'useTls': cfg['use_tls'], 'verifySsl': cfg.get('verify_ssl', True), 'user': cfg['user'], 'fromEmail': cfg['from_email'],
             'passwordSet': bool(cfg['password']), 'mailMode': _mail_mode(),
         })
     except Exception as e:
         return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
 
 
-NOTIFY_KINDS = ('admin', 'telecalling')
+FINANCE_ROLES = ('accounts', 'management', 'superadmin')   # may approve / reject a centre change request
+DIRECT_CENTRE_ROLES = ('management', 'superadmin')          # may change a centre directly, without a request
+
+
+def centre_list(request):
+    """Every centre (id + name), independent of the signed-in user's centre scope — used by the Change Centre picker."""
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT center_number, center_name FROM hms_centers
+                WHERE center_name IS NOT NULL AND TRIM(center_name) <> ''
+                ORDER BY center_name ASC
+            """)
+            rows = [{'id': r[0], 'name': str(r[1]).strip()} for r in cursor.fetchall()]
+        return JsonResponse({'status': 'success', 'centres': rows})
+    except Exception as e:
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+
+
+NOTIFY_KINDS = ('admin', 'telecalling', 'accountant')
 
 
 def _get_notify_recipients():
@@ -1280,9 +1498,11 @@ def notify_recipients(request):
                 )
                 return JsonResponse({'status': 'success', 'mail': result, 'mailMode': _mail_mode(),
                                      'fromEmail': _load_mail_config()['from_email'], **_get_notify_recipients()})
-            if not re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', email):
+            if not _re_log.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', email):
                 return JsonResponse({'status': 'error', 'message': 'Enter a valid email address.'}, status=400)
             ensure_aging_action_tables()
+            if op == 'remove' and str(data.get('role') or '').strip().lower() not in DIRECT_CENTRE_ROLES:
+                return JsonResponse({'status': 'error', 'message': 'Only the Administrator can remove an email.'}, status=403)
             with connection.cursor() as cursor:
                 if op == 'remove':
                     cursor.execute("DELETE FROM reports_notifyrecipient WHERE kind = %s AND email = %s", [kind, email])
@@ -1315,12 +1535,7 @@ def _send_aging_mail(targets, subject, lines, extra_to=None):
         body = "\n".join(lines) + "\n\n— India IVF HMS"
         cfg = _load_mail_config()
         if cfg['host']:
-            from django.core.mail import get_connection
-            conn = get_connection(
-                backend='django.core.mail.backends.smtp.EmailBackend',
-                host=cfg['host'], port=cfg['port'], username=cfg['user'], password=cfg['password'],
-                use_tls=cfg['use_tls'], timeout=20, fail_silently=False,
-            )
+            conn = _smtp_connection(cfg)
             send_mail(subject, body, cfg['from_email'] or cfg['user'], recipients, fail_silently=False, connection=conn)
         else:
             send_mail(subject, body, dj_settings.DEFAULT_FROM_EMAIL, recipients, fail_silently=False)
@@ -1345,6 +1560,9 @@ def save_aging_action(request):
         ensure_aging_action_tables()
         stamp = timezone.now().strftime('%d-%b-%Y %H:%M')
         log_user = str(data.get('user') or '').strip()
+        user_role = str(data.get('role') or '').strip()
+        centre_change = None
+        new_sales_centre = None
         to_value = ''
         override = ''
         reason = str(data.get('reason') or '').strip()
@@ -1380,8 +1598,70 @@ def save_aging_action(request):
                 return JsonResponse({'status': 'error', 'message': 'New centre and reason are required.'}, status=400)
             if to_centre == from_centre:
                 return JsonResponse({'status': 'error', 'message': 'Choose a different centre.'}, status=400)
-            to_value = to_centre
-            log_line = f"[{stamp}] Sales reporting centre: {from_centre or '—'} → {to_centre} — Reason: {reason}"
+            if user_role == 'view_only':
+                return JsonResponse({'status': 'error', 'message': 'View-only access — you cannot make changes.'}, status=403)
+            with connection.cursor() as cursor:
+                if user_role == 'accounts':
+                    return JsonResponse({'status': 'error', 'message': 'Accounts can approve or reject centre change requests, not change the centre directly.'}, status=403)
+                if user_role in DIRECT_CENTRE_ROLES:
+                    # Management / Superadmin change it straight away.
+                    to_value = to_centre
+                    log_line = f"[{stamp}] Sales reporting centre: {from_centre or '—'} → {to_centre} — Reason: {reason}"
+                    cursor.execute("""
+                        INSERT INTO reports_centrechange (invoice, patient_id, from_centre, to_centre, reason, state, requested_by, decided_by)
+                        VALUES (%s, %s, %s, %s, %s, 'Approved', %s, %s)
+                        ON DUPLICATE KEY UPDATE from_centre = VALUES(from_centre), to_centre = VALUES(to_centre), reason = VALUES(reason),
+                                                state = 'Approved', requested_by = VALUES(requested_by), decided_by = VALUES(decided_by),
+                                                decision_comment = ''
+                    """, [invoice, patient_id, from_centre, to_centre, reason, log_user, log_user])
+                    centre_change = {'state': 'Approved', 'to': to_centre, 'reason': reason, 'by': log_user}
+                    new_sales_centre = to_centre
+                else:
+                    # Counsellor / centre staff only REQUEST it — Accounts approves.
+                    to_value = ''
+                    log_line = f"[{stamp}] Centre change requested: {from_centre or '—'} → {to_centre} — Reason: {reason}"
+                    cursor.execute("""
+                        INSERT INTO reports_centrechange (invoice, patient_id, from_centre, to_centre, reason, state, requested_by, decided_by)
+                        VALUES (%s, %s, %s, %s, %s, 'Requested', %s, '')
+                        ON DUPLICATE KEY UPDATE from_centre = VALUES(from_centre), to_centre = VALUES(to_centre), reason = VALUES(reason),
+                                                state = 'Requested', requested_by = VALUES(requested_by), decided_by = '',
+                                                decision_comment = ''
+                    """, [invoice, patient_id, from_centre, to_centre, reason, log_user])
+                    centre_change = {'state': 'Requested', 'to': to_centre, 'reason': reason, 'by': log_user}
+
+        elif kind == 'review_centre_change':
+            if user_role not in FINANCE_ROLES:
+                return JsonResponse({'status': 'error', 'message': 'Only the Accounts team can approve a centre change.'}, status=403)
+            decision = str(data.get('decision') or '').strip()
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT from_centre, to_centre, reason, state, requested_by FROM reports_centrechange WHERE invoice = %s", [invoice])
+                row = cursor.fetchone()
+            if not row or row[3] != 'Requested':
+                return JsonResponse({'status': 'error', 'message': 'There is no pending centre change request for this invoice.'}, status=400)
+            req_from, req_to, req_reason, _st, req_by = row
+            if decision == 'approved':
+                pick = str(data.get('to_centre') or '').strip()
+                if pick and pick != req_to:          # Accounts chose a different centre than the one requested
+                    req_to = pick
+                    with connection.cursor() as cursor:
+                        cursor.execute("UPDATE reports_centrechange SET to_centre = %s WHERE invoice = %s", [req_to, invoice])
+                to_value = req_to
+                log_line = f"[{stamp}] Centre change APPROVED: {req_from or '—'} → {req_to}"
+                new_state_cc = 'Approved'
+                new_sales_centre = req_to
+            elif decision == 'rejected':
+                to_value = ''
+                log_line = f"[{stamp}] Centre change NOT approved: {req_from or '—'} → {req_to}"
+                new_state_cc = 'Rejected'
+            else:
+                return JsonResponse({'status': 'error', 'message': 'Choose Approve or Reject.'}, status=400)
+            if remarks:
+                log_line += f" — {remarks}"
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    UPDATE reports_centrechange SET state = %s, decided_by = %s, decision_comment = %s WHERE invoice = %s
+                """, [new_state_cc, log_user, remarks[:500], invoice])
+            centre_change = {'state': new_state_cc, 'to': req_to, 'reason': req_reason, 'by': req_by}
 
         elif kind in ('revert_tele', 'direct_cancellation', 'review_cancellation'):
             with connection.cursor() as cursor:
@@ -1394,14 +1674,16 @@ def save_aging_action(request):
             wf_reason = ''
             mark_referred = False
             reactivate = False
+            send_tele_mail = False
 
             if kind == 'revert_tele':
                 mode = str(data.get('mode') or 'revert').strip()
                 if mode == 'revert':
-                    new_state = 'With Telecalling (Megha)'
+                    new_state = 'With Telecalling'
                     mark_referred = True
-                    log_line = f"[{stamp}] Reverted to Telecalling Team (Megha)"
-                    notify_to, notify_subject = ['telecalling'], "Patient reverted to Telecalling Team"
+                    log_line = f"[{stamp}] Reverted to Telecalling Team"
+                    notify_to, notify_subject = [], ""
+                    send_tele_mail = True      # HTML mail with the two buttons is built after the log line is final
                 elif mode == 'reactive':
                     new_state = 'ReActive – Returned to Branch'
                     reactivate = True
@@ -1422,7 +1704,7 @@ def save_aging_action(request):
                 new_state = 'Cancellation Requested'
                 wf_reason = reason
                 log_line = f"[{stamp}] Direct cancellation request — Reason: {reason}"
-                notify_to, notify_subject = ['admin'], "Direct cancellation request — approval needed"
+                notify_to, notify_subject = [], ""      # mails are built below (approval links + requester + accountant cc)
 
             else:  # review_cancellation (Superadmin)
                 if current_state != 'Cancellation Requested':
@@ -1440,7 +1722,7 @@ def save_aging_action(request):
                         return JsonResponse({'status': 'error', 'message': 'Refund amount cannot be negative.'}, status=400)
                     new_state = 'Cancellation Approved'
                     log_line = f"[{stamp}] Cancellation APPROVED — Refund ₹{refund_amount:,.0f}"
-                    notify_to, notify_subject = ['admin'], "Cancellation APPROVED"
+                    notify_to, notify_subject = [], ""
                 elif decision == 'not_approved':
                     route = str(data.get('route') or '').strip()
                     if route == 'forward_megha':
@@ -1453,7 +1735,7 @@ def save_aging_action(request):
                             return JsonResponse({'status': 'error', 'message': 'A comment is required when returning to the centre.'}, status=400)
                         new_state = 'Returned to Centre'
                         log_line = f"[{stamp}] Cancellation NOT approved — returned to centre"
-                        notify_to, notify_subject = ['admin'], "Cancellation not approved — returned to centre"
+                        notify_to, notify_subject = [], ""
                     else:
                         return JsonResponse({'status': 'error', 'message': 'Choose where to send it: Megha or the centre.'}, status=400)
                 else:
@@ -1499,8 +1781,12 @@ def save_aging_action(request):
                 INSERT INTO reports_agingaction (invoice, patient_id, action_type, to_value, log_line)
                 VALUES (%s, %s, %s, %s, %s)
             """, [invoice, patient_id, kind, to_value, log_line])
+        _push_notif(invoice, patient_id, log_line)
 
         resp = {'status': 'success', 'message': 'Saved.', 'logLine': log_line}
+        if centre_change is not None:
+            resp['centreChange'] = centre_change
+            resp['salesCentre'] = new_sales_centre
         if notify_to:
             mail_lines = [
                 f"Action   : {notify_subject}",
@@ -1519,6 +1805,18 @@ def save_aging_action(request):
                     mail_lines.append(f"Comment  : {wf_comment}")
             mail_lines += ["", log_line]
             resp['mail'] = _send_aging_mail(notify_to, "[India IVF HMS] " + notify_subject, mail_lines)
+        if kind == 'revert_tele' and send_tele_mail:
+            resp['mail'] = _send_revert_mail(request, data, ctx, invoice, patient_id, remarks, log_user, log_line)
+        if kind == 'direct_cancellation':
+            resp['mail'] = _send_cancel_request_mails(request, data, ctx, invoice, patient_id, wf_reason, remarks, log_user)
+        if kind == 'review_cancellation':
+            fb = {'patient_id': patient_id, 'name': ctx.get('name') or '', 'centre': ctx.get('centre') or '', 'pkg': ctx.get('pkg') or '',
+                  'reason': wf_reason}
+            dec_mail = _notify_cancel_decision(invoice, 'approved' if new_state == 'Cancellation Approved' else 'disapproved',
+                                               refund_amount, wf_comment, log_user, fallback=fb)
+            resp['mailDecision'] = dec_mail
+            if 'mail' not in resp:
+                resp['mail'] = dec_mail
         if kind in ('revert_tele', 'direct_cancellation', 'review_cancellation'):
             resp.update({
                 'requestState': new_state,
@@ -1578,7 +1876,10 @@ def get_aging_snapshot(request):
             f.status AS follow_status,
             f.referred_date AS follow_referred,
             f.history_log AS follow_history,
-            DATE(f.updated_at) AS follow_updated
+            DATE(f.updated_at) AS follow_updated,
+            f.next_followup_date AS next_fu,
+            f.next_followup_set_at AS next_fu_set,
+            p.modified_on AS proc_modified
         FROM hms_patient_procedure p
         LEFT JOIN hms_appointments a ON a.id = p.appointment_id
         LEFT JOIN hms_centers c ON p.billing_at = c.center_number
@@ -1646,14 +1947,25 @@ def get_aging_snapshot(request):
                     "refund": float(refund) if refund is not None else None, "comment": cmt or "",
                 }
 
+        centre_change_by_invoice = {}
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT invoice, state, to_centre, reason, requested_by, decision_comment FROM reports_centrechange")
+                for inv, st, to_c, rsn, by, cmt in cursor.fetchall():
+                    centre_change_by_invoice[inv] = {"state": st or "", "to": to_c or "", "reason": rsn or "", "by": by or "", "comment": cmt or ""}
+        except Exception:
+            centre_change_by_invoice = {}
+
         action_lines = {}
         sales_centre_by_invoice = {}
         with connection.cursor() as cursor:
             cursor.execute("SELECT invoice, action_type, to_value, log_line FROM reports_agingaction ORDER BY id ASC")
             for inv, atype, to_val, line in cursor.fetchall():
                 action_lines.setdefault(inv, []).append(line or "")
-                if atype == "change_centre" and to_val:
+                if atype in ("change_centre", "review_centre_change") and to_val:
                     sales_centre_by_invoice[inv] = to_val
+            cursor.execute("SELECT invoice, MAX(created_at) FROM reports_agingaction GROUP BY invoice")
+            last_action_at = {inv: ts for inv, ts in cursor.fetchall()}
 
         today_date = date.today()
 
@@ -1699,6 +2011,21 @@ def get_aging_snapshot(request):
             discount_amount = float(r["discount_amount"] or 0)
             disc_pct = round((discount_amount / gross * 100), 2) if gross else 0.0
 
+            # Next follow-up: "Overdue" when the date has passed and nothing happened on this procedure since it was set
+            # (no new action / comment and no change on the procedure itself, e.g. a payment).
+            next_fu = r.get("next_fu")
+            fu_overdue, fu_days = False, 0
+            if next_fu and next_fu < today_date:
+                set_at = r.get("next_fu_set")
+                acts = [t for t in (last_action_at.get(r["invoice"]), r.get("proc_modified")) if t]
+                try:
+                    last_act = max(acts) if acts else None
+                    active_since = bool(set_at and last_act and last_act > set_at)
+                except TypeError:
+                    active_since = False
+                fu_overdue = not active_since
+                fu_days = (today_date - next_fu).days if fu_overdue else 0
+
             patients.append({
                 "id": r["id"],
                 "name": r["name"] or "",
@@ -1713,6 +2040,9 @@ def get_aging_snapshot(request):
                 "daysOverdue": days,
                 "lastFu": iso(r["follow_updated"]) or iso(r["last_fu"]),
                 "referred": iso(r["follow_referred"]),
+                "nextFu": iso(next_fu),
+                "fuOverdue": fu_overdue,
+                "fuOverdueDays": fu_days,
                 "status": r["follow_status"] or r["status"] or "",
                 "invoice": r["invoice"] or "",
                 "history": _history_text([r["follow_history"] or ""], action_lines.get(r["invoice"], [])),
@@ -1721,6 +2051,10 @@ def get_aging_snapshot(request):
                 "statusOverride": overrides_by_invoice.get(r["invoice"], {}).get("override", ""),
                 "statusReason": overrides_by_invoice.get(r["invoice"], {}).get("reason", ""),
                 "salesCentre": sales_centre_by_invoice.get(r["invoice"], ""),
+                "centreChangeState": centre_change_by_invoice.get(r["invoice"], {}).get("state", ""),
+                "centreChangeTo": centre_change_by_invoice.get(r["invoice"], {}).get("to", ""),
+                "centreChangeReason": centre_change_by_invoice.get(r["invoice"], {}).get("reason", ""),
+                "centreChangeBy": centre_change_by_invoice.get(r["invoice"], {}).get("by", ""),
                 "requestState": workflow_by_invoice.get(r["invoice"], {}).get("state", ""),
                 "requestReason": workflow_by_invoice.get(r["invoice"], {}).get("reason", ""),
                 "refundAmount": workflow_by_invoice.get(r["invoice"], {}).get("refund"),
@@ -2199,5 +2533,667 @@ def get_dashboard_summary(request):
             "stageByCentre": stage_by_centre,
             "weekTrend": week_trend,
         })
+    except Exception as e:
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+
+
+# ---- Direct Cancellation: approval by e-mail ------------------------------------------------------
+# Request  -> mail to Administrator (cc Accountant) with Approve / Disapprove buttons; confirmation mail to the requester.
+# Decision -> mail to the requester, cc Accountant.  The buttons open a small confirmation page served at
+#             /api/cancel-decision (public, protected by a signed, expiring token).
+from django.core import signing as _signing
+from django.core.mail import EmailMultiAlternatives as _EmailMulti, get_connection as _get_conn
+from django.utils.html import escape as _esc
+from django.http import HttpResponse as _HttpResponse
+
+CANCEL_SALT = 'india-ivf-cancel-decision'
+CANCEL_LINK_MAX_AGE = 60 * 60 * 24 * 30      # links stay valid for 30 days
+
+
+def _send_mail_raw(to, subject, text, html=None, cc=None):
+    """Send one mail (optionally HTML + cc) through the saved SMTP settings. Never raises."""
+    to = [e for e in dict.fromkeys(to or []) if e]
+    cc = [e for e in dict.fromkeys(cc or []) if e and e not in to]
+    if not to:
+        return {'sent': 0, 'mode': _mail_mode(), 'note': 'No recipient email configured.'}
+    try:
+        cfg = _load_mail_config()
+        if cfg['host']:
+            conn = _smtp_connection(cfg)
+            from_email = cfg['from_email'] or cfg['user']
+        else:
+            conn, from_email = None, dj_settings.DEFAULT_FROM_EMAIL
+        msg = _EmailMulti(subject, text, from_email, to, cc=cc, connection=conn)
+        if html:
+            msg.attach_alternative(html, 'text/html')
+        msg.send(fail_silently=False)
+        return {'sent': len(to) + len(cc), 'mode': _mail_mode()}
+    except Exception as e:
+        return {'sent': 0, 'mode': _mail_mode(), 'error': str(e)}
+
+
+def _cancel_info(invoice):
+    ensure_aging_action_tables()
+    with connection.cursor() as cursor:
+        cursor.execute("""
+            SELECT patient_id, patient_name, centre, pkg, outstanding, collected, reason, remarks, requested_by, requester_email
+            FROM reports_cancelrequest WHERE invoice = %s
+        """, [invoice])
+        r = cursor.fetchone()
+    if not r:
+        return {'invoice': invoice, 'patient_id': '', 'name': '', 'centre': '', 'pkg': '', 'outstanding': 0.0, 'collected': 0.0,
+                'reason': '', 'remarks': '', 'requested_by': '', 'requester_email': ''}
+    return {'invoice': invoice, 'patient_id': r[0] or '', 'name': r[1] or '', 'centre': r[2] or '', 'pkg': r[3] or '',
+            'outstanding': float(r[4] or 0), 'collected': float(r[5] or 0), 'reason': r[6] or '', 'remarks': r[7] or '',
+            'requested_by': r[8] or '', 'requester_email': r[9] or ''}
+
+
+def _cancel_rows(info):
+    rows = [
+        ('Patient', f"{info['name'] or '—'} ({info['patient_id'] or '—'})"),
+        ('Invoice', info['invoice']),
+        ('Centre', info['centre'] or '—'),
+        ('Package', info['pkg'] or '—'),
+        ('Amount collected', f"₹{info['collected']:,.0f}"),
+        ('Outstanding', f"₹{info['outstanding']:,.0f}"),
+        ('Cancellation reason', info['reason'] or '—'),
+        ('Requested by', info['requested_by'] or '—'),
+    ]
+    if info['remarks']:
+        rows.append(('Remarks', info['remarks']))
+    return rows
+
+
+def _rows_text(rows):
+    return "\n".join(f"{k:<20}: {v}" for k, v in rows)
+
+
+def _rows_html(rows):
+    body = "".join(
+        f"<tr><td style='padding:5px 14px 5px 0;color:#64748b;white-space:nowrap'>{_esc(k)}</td>"
+        f"<td style='padding:5px 0;color:#0f172a;font-weight:600'>{_esc(v)}</td></tr>" for k, v in rows)
+    return f"<table style='border-collapse:collapse;font-size:14px'>{body}</table>"
+
+
+def _send_cancel_request_mails(request, data, ctx, invoice, patient_id, reason, remarks, requested_by):
+    req_email = str(data.get('requester_email') or '').strip().lower()
+    if '@' not in req_email:
+        req_email = ''
+    def _num(v):
+        try:
+            return float(v or 0)
+        except (TypeError, ValueError):
+            return 0.0
+    with connection.cursor() as cursor:
+        cursor.execute("""
+            INSERT INTO reports_cancelrequest
+                (invoice, patient_id, patient_name, centre, pkg, outstanding, collected, reason, remarks, requested_by, requester_email)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE patient_id = VALUES(patient_id), patient_name = VALUES(patient_name), centre = VALUES(centre),
+                pkg = VALUES(pkg), outstanding = VALUES(outstanding), collected = VALUES(collected), reason = VALUES(reason),
+                remarks = VALUES(remarks), requested_by = VALUES(requested_by), requester_email = VALUES(requester_email)
+        """, [invoice, patient_id, str(ctx.get('name') or '')[:255], str(ctx.get('centre') or '')[:255], str(ctx.get('pkg') or '')[:255],
+              _num(ctx.get('outstanding')), _num(ctx.get('collected')), reason, remarks[:500], requested_by[:150], req_email[:190]])
+    info = _cancel_info(invoice)
+
+    origin = str(data.get('origin') or '').strip().rstrip('/')
+    if not origin.startswith(('http://', 'https://')):
+        origin = request.build_absolute_uri('/').rstrip('/')
+    token = _signing.dumps({'i': invoice}, salt=CANCEL_SALT)
+    base = f"{origin}/api/cancel-decision?t={token}"
+    approve_url, disapprove_url = base + "&a=approve", base + "&a=disapprove"
+
+    lists = _get_notify_recipients()
+    rows = _cancel_rows(info)
+    subject = f"[India IVF HMS] Direct cancellation request — approval needed ({info['name'] or invoice})"
+    text = (f"A direct cancellation request needs your approval.\n\n{_rows_text(rows)}\n\n"
+            f"Approve    : {approve_url}\nDisapprove : {disapprove_url}\n\n— India IVF HMS")
+    html = (
+        "<div style='font-family:Segoe UI,Arial,sans-serif;max-width:560px'>"
+        "<h3 style='margin:0 0 6px;color:#9f1d52'>Direct cancellation request</h3>"
+        "<p style='margin:0 0 12px;color:#475569'>This request needs your approval.</p>"
+        f"{_rows_html(rows)}"
+        "<p style='margin:18px 0 0'>"
+        f"<a href='{_esc(approve_url)}' style='background:#15803d;color:#fff;text-decoration:none;padding:10px 18px;border-radius:8px;font-weight:700;margin-right:10px;display:inline-block'>Approve</a>"
+        f"<a href='{_esc(disapprove_url)}' style='background:#b91c1c;color:#fff;text-decoration:none;padding:10px 18px;border-radius:8px;font-weight:700;display:inline-block'>Disapprove</a>"
+        "</p><p style='color:#94a3b8;font-size:12px;margin-top:16px'>The buttons open a confirmation page — nothing changes until you confirm there.</p></div>")
+    if lists['admin']:
+        result = _send_mail_raw(lists['admin'], subject, text, html, cc=lists['accountant'])
+    else:
+        result = {'sent': 0, 'mode': _mail_mode(), 'note': 'No Admin email configured.'}
+
+    if req_email:
+        ack_text = (f"Your direct cancellation request has been sent to the Administrator for approval.\n\n{_rows_text(rows)}\n\n"
+                    "You will get another mail when it is approved or disapproved.\n\n— India IVF HMS")
+        ack_html = ("<div style='font-family:Segoe UI,Arial,sans-serif;max-width:560px'>"
+                    "<h3 style='margin:0 0 6px;color:#9f1d52'>Cancellation request submitted</h3>"
+                    "<p style='color:#475569'>Your request has been sent to the Administrator for approval. "
+                    "You will get another mail once it is approved or disapproved.</p>" + _rows_html(rows) + "</div>")
+        ack = _send_mail_raw([req_email], f"[India IVF HMS] Cancellation request submitted ({info['name'] or invoice})", ack_text, ack_html)
+        result['requesterMailed'] = bool(ack.get('sent'))
+        if ack.get('error') and not result.get('error'):
+            result['error'] = ack['error']
+    else:
+        result['requesterMailed'] = False
+        result['requesterNote'] = 'Your login has no email, so no confirmation mail was sent to you.'
+    return result
+
+
+def _notify_cancel_decision(invoice, decision, refund, comment, decided_by, fallback=None):
+    """Mail the requester (cc Accountant) about an approve / disapprove decision."""
+    info = _cancel_info(invoice)
+    if fallback:
+        for k, v in fallback.items():
+            if not info.get(k) and v:
+                info[k] = v
+    lists = _get_notify_recipients()
+    accountants = lists['accountant']
+    approved = decision == 'approved'
+    word = 'APPROVED' if approved else 'DISAPPROVED'
+    rows = _cancel_rows(info) + [('Decision', word), ('Decided by', decided_by or 'Administrator')]
+    if approved and refund is not None:
+        rows.append(('Refund amount', f"₹{refund:,.0f}"))
+    if comment:
+        rows.append(('Comment', comment))
+    colour = '#15803d' if approved else '#b91c1c'
+    subject = f"[India IVF HMS] Cancellation request {word} ({info['name'] or invoice})"
+    text = f"Your direct cancellation request has been {word}.\n\n{_rows_text(rows)}\n\n— India IVF HMS"
+    html = ("<div style='font-family:Segoe UI,Arial,sans-serif;max-width:560px'>"
+            f"<h3 style='margin:0 0 6px;color:{colour}'>Cancellation request {word}</h3>" + _rows_html(rows) + "</div>")
+    to = [info['requester_email']] if info['requester_email'] else []
+    if to:
+        return _send_mail_raw(to, subject, text, html, cc=accountants)
+    if accountants:
+        return _send_mail_raw(accountants, subject, text, html)
+    return {'sent': 0, 'mode': _mail_mode(), 'note': 'No requester / Accountant email available.'}
+
+
+def _apply_cancel_decision(invoice, decision, refund, comment, decided_by):
+    """Same outcome as the in-app 'Cancellation Review'. Returns (ok, message, new_state)."""
+    ensure_aging_action_tables()
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT state, patient_id, reason FROM reports_agingworkflow WHERE invoice = %s", [invoice])
+        row = cursor.fetchone()
+    if not row or row[0] != 'Cancellation Requested':
+        return False, f"This request has already been decided ({row[0] if row else 'no pending request'}).", (row[0] if row else '')
+    _state, patient_id, wf_reason = row
+    if decision == 'approved':
+        new_state = 'Cancellation Approved'
+        log = f"Cancellation APPROVED — Refund ₹{refund:,.0f}"
+        refund_val = refund
+    else:
+        new_state = 'Returned to Centre'
+        log = "Cancellation NOT approved — returned to centre"
+        refund_val = None
+    if comment:
+        log += f" — {comment}"
+    with connection.cursor() as cursor:
+        cursor.execute("""
+            INSERT INTO reports_agingworkflow (invoice, patient_id, state, reason, refund_amount, comment)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE state = VALUES(state), reason = VALUES(reason),
+                                    refund_amount = VALUES(refund_amount), comment = VALUES(comment)
+        """, [invoice, patient_id, new_state, wf_reason, refund_val, comment])
+        cursor.execute("""
+            INSERT INTO reports_agingaction (invoice, patient_id, action_type, to_value, log_line)
+            VALUES (%s, %s, 'review_cancellation', '', %s)
+        """, [invoice, patient_id, _fmt_log(decided_by, log)])
+    _push_notif(invoice, patient_id, _fmt_log(decided_by, log))
+    return True, new_state, new_state
+
+
+_CANCEL_PAGE_CSS = (
+    "body{font-family:Segoe UI,Arial,sans-serif;background:#f8fafc;margin:0;padding:24px;color:#0f172a}"
+    ".card{max-width:560px;margin:0 auto;background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:24px}"
+    "h2{margin:0 0 4px;color:#9f1d52}.sub{color:#64748b;font-size:13px;margin-bottom:16px}"
+    "label{display:block;font-size:12px;font-weight:600;color:#475569;margin:10px 0 4px}"
+    "input,textarea{width:100%;box-sizing:border-box;border:1px solid #cbd5e1;border-radius:8px;padding:9px 10px;font-size:14px}"
+    "button{border:0;border-radius:8px;padding:10px 18px;font-weight:700;color:#fff;cursor:pointer;margin-top:12px;font-size:14px}"
+    ".ok{background:#15803d}.no{background:#b91c1c}.box{border:1px solid #e2e8f0;border-radius:10px;padding:14px;margin-top:16px}"
+    ".msg{padding:10px 12px;border-radius:8px;margin-bottom:12px;font-size:13px}.err{background:#fee2e2;color:#991b1b}.good{background:#dcfce7;color:#166534}"
+)
+
+
+def _cancel_page(inner, status=200):
+    html = f"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Cancellation request</title><style>{_CANCEL_PAGE_CSS}</style></head><body><div class='card'>{inner}</div></body></html>"
+    return _HttpResponse(html, status=status, content_type='text/html; charset=utf-8')
+
+
+@csrf_exempt
+def cancel_decision(request):
+    """Public (token-protected) confirmation page behind the Approve / Disapprove buttons in the mail."""
+    token = request.POST.get('t') or request.GET.get('t') or ''
+    try:
+        payload = _signing.loads(token, salt=CANCEL_SALT, max_age=CANCEL_LINK_MAX_AGE)
+        invoice = str(payload.get('i') or '')
+    except _signing.BadSignature:
+        return _cancel_page("<h2>Link not valid</h2><div class='sub'>This link is invalid or has expired. Please decide from the Aging page instead.</div>", 400)
+
+    with connection.cursor() as cursor:
+        ensure_aging_action_tables()
+        cursor.execute("SELECT state FROM reports_agingworkflow WHERE invoice = %s", [invoice])
+        r = cursor.fetchone()
+    state = r[0] if r else ''
+    info = _cancel_info(invoice)
+    details = _rows_html(_cancel_rows(info))
+    error = ''
+
+    if request.method == 'POST':
+        action = request.POST.get('action') or ''
+        comment = (request.POST.get('comment') or '').strip()[:500]
+        decided_by = 'Administrator (email link)'
+        if action == 'approve':
+            try:
+                refund = float(request.POST.get('refund_amount') or 0)
+                if refund < 0:
+                    raise ValueError
+            except ValueError:
+                refund = None
+                error = 'Enter a valid refund amount.'
+            if refund is not None:
+                ok, msg, new_state = _apply_cancel_decision(invoice, 'approved', refund, comment, decided_by)
+                if not ok:
+                    return _cancel_page(f"<h2>Already decided</h2><div class='sub'>{_esc(msg)}</div>{details}")
+                _notify_cancel_decision(invoice, 'approved', refund, comment, decided_by)
+                return _cancel_page(f"<h2>Cancellation approved</h2><div class='msg good'>Refund ₹{refund:,.0f}. The requester has been informed (Accountant in cc).</div>{details}")
+        elif action == 'disapprove':
+            ok, msg, new_state = _apply_cancel_decision(invoice, 'disapproved', None, comment, decided_by)
+            if not ok:
+                return _cancel_page(f"<h2>Already decided</h2><div class='sub'>{_esc(msg)}</div>{details}")
+            _notify_cancel_decision(invoice, 'disapproved', None, comment, decided_by)
+            return _cancel_page(f"<h2>Cancellation disapproved</h2><div class='msg good'>The requester has been informed (Accountant in cc).</div>{details}")
+        else:
+            error = 'Choose Approve or Disapprove.'
+
+    if state != 'Cancellation Requested':
+        return _cancel_page(f"<h2>No pending request</h2><div class='sub'>This request is not waiting for approval (current state: {_esc(state or 'none')}).</div>{details}")
+
+    pre = request.GET.get('a') or ''
+    err_html = f"<div class='msg err'>{_esc(error)}</div>" if error else ''
+    default_refund = f"{info['collected']:.0f}"
+    ok_style = " style='border-color:#15803d'" if pre == 'approve' else ''
+    no_style = " style='border-color:#b91c1c'" if pre == 'disapprove' else ''
+    tok = _esc(token)
+    inner = (
+        "<h2>Direct cancellation request</h2><div class='sub'>Please confirm your decision.</div>" + err_html + details +
+        f"<div class='box'{ok_style}><b>Approve</b>"
+        f"<form method='post'><input type='hidden' name='t' value='{tok}'><input type='hidden' name='action' value='approve'>"
+        f"<label>Refund amount (₹)</label><input name='refund_amount' inputmode='decimal' value='{_esc(default_refund)}'>"
+        "<label>Comment (optional)</label><textarea name='comment' rows='2'></textarea>"
+        "<button class='ok' type='submit'>Confirm approval</button></form></div>"
+        f"<div class='box'{no_style}><b>Disapprove</b>"
+        f"<form method='post'><input type='hidden' name='t' value='{tok}'><input type='hidden' name='action' value='disapprove'>"
+        "<label>Comment (optional)</label><textarea name='comment' rows='2'></textarea>"
+        "<button class='no' type='submit'>Confirm disapproval</button></form></div>"
+    )
+    return _cancel_page(inner)
+
+
+# ---- Stage-delay reasons: mail to the Administrator + reply back --------------------------------------
+# A delay reason saved on the Journey page mails the Administrator (Reply button inside the mail). The
+# Administrator replies from that mail page or from the Journey popup; the reply is mailed to whoever
+# recorded the reason and shown in the popup.
+DELAY_SALT = 'india-ivf-stage-delay-reply'
+DELAY_LINK_MAX_AGE = 60 * 60 * 24 * 60
+
+
+def _delay_row(patient_id, cycle_key, stage_key):
+    ensure_stage_delay_table()
+    with connection.cursor() as cursor:
+        cursor.execute("""
+            SELECT reason, remarks, ideal_date, actual_date, admin_reply, replied_by, replied_at,
+                   requested_by, requester_email, patient_name
+            FROM reports_stagedelay WHERE patient_id = %s AND cycle_key = %s AND stage_key = %s
+        """, [patient_id, cycle_key, stage_key])
+        r = cursor.fetchone()
+    if not r:
+        return None
+    return {
+        'patient_id': patient_id, 'cycle_key': cycle_key, 'stage_key': stage_key,
+        'reason': r[0] or '', 'remarks': r[1] or '',
+        'ideal': r[2].isoformat() if r[2] else '', 'actual': r[3].isoformat() if r[3] else '',
+        'reply': r[4] or '', 'replied_by': r[5] or '', 'replied_at': r[6].strftime('%d-%b-%y %I:%M %p') if r[6] else '',
+        'requested_by': r[7] or '', 'requester_email': r[8] or '', 'name': r[9] or '',
+    }
+
+
+def _delay_rows(info):
+    rows = [
+        ('Patient', f"{info['name'] or '—'} ({info['patient_id']})"),
+        ('Cycle', info['cycle_key'] or '—'),
+        ('Stage', info['stage_key']),
+        ('Ideal date', info['ideal'] or '—'),
+        ('Actual date', info['actual'] or 'Not done yet'),
+        ('Delay reason', info['reason']),
+    ]
+    if info['remarks']:
+        rows.append(('Remarks', info['remarks']))
+    rows.append(('Reported by', info['requested_by'] or '—'))
+    return rows
+
+
+def _send_delay_mail(request, data, info):
+    origin = str(data.get('origin') or '').strip().rstrip('/')
+    if not origin.startswith(('http://', 'https://')):
+        origin = request.build_absolute_uri('/').rstrip('/')
+    token = _signing.dumps({'p': info['patient_id'], 'c': info['cycle_key'], 's': info['stage_key']}, salt=DELAY_SALT)
+    reply_url = f"{origin}/api/stage-delay-reply?t={token}"
+    rows = _delay_rows(info)
+    subject = f"[India IVF HMS] Stage delayed — {info['stage_key']} ({info['name'] or info['patient_id']})"
+    text = f"A stage has been marked delayed.\n\n{_rows_text(rows)}\n\nReply: {reply_url}\n\n— India IVF HMS"
+    html = ("<div style='font-family:Segoe UI,Arial,sans-serif;max-width:560px'>"
+            "<h3 style='margin:0 0 6px;color:#9f1d52'>Stage delayed</h3>"
+            "<p style='margin:0 0 12px;color:#475569'>The reason below was recorded for a delayed stage.</p>"
+            f"{_rows_html(rows)}"
+            f"<p style='margin:18px 0 0'><a href='{_esc(reply_url)}' style='background:#9f1d52;color:#fff;text-decoration:none;"
+            "padding:10px 18px;border-radius:8px;font-weight:700;display:inline-block'>Reply</a></p></div>")
+    lists = _get_notify_recipients()
+    if not lists['admin']:
+        return {'sent': 0, 'mode': _mail_mode(), 'note': 'No Admin email configured.'}
+    return _send_mail_raw(lists['admin'], subject, text, html)
+
+
+def _save_delay_reply(patient_id, cycle_key, stage_key, reply, by):
+    info = _delay_row(patient_id, cycle_key, stage_key)
+    if not info:
+        return False, 'No delay reason has been recorded for this stage yet.', None
+    with connection.cursor() as cursor:
+        cursor.execute("""
+            UPDATE reports_stagedelay SET admin_reply = %s, replied_by = %s, replied_at = %s
+            WHERE patient_id = %s AND cycle_key = %s AND stage_key = %s
+        """, [reply[:2000], by[:150], _log_now().replace(tzinfo=None), patient_id, cycle_key, stage_key])
+    info = _delay_row(patient_id, cycle_key, stage_key)
+    rows = _delay_rows(info) + [('Administrator reply', reply), ('Replied by', by or 'Administrator')]
+    subject = f"[India IVF HMS] Administrator replied — {info['stage_key']} ({info['name'] or info['patient_id']})"
+    text = f"The Administrator replied about a delayed stage.\n\n{_rows_text(rows)}\n\n— India IVF HMS"
+    html = ("<div style='font-family:Segoe UI,Arial,sans-serif;max-width:560px'>"
+            "<h3 style='margin:0 0 6px;color:#9f1d52'>Administrator replied</h3>" + _rows_html(rows) + "</div>")
+    if info['requester_email']:
+        mail = _send_mail_raw([info['requester_email']], subject, text, html)
+    else:
+        mail = {'sent': 0, 'mode': _mail_mode(), 'note': 'The person who recorded this reason has no email saved, so no mail was sent.'}
+    return True, 'Reply saved.', mail
+
+
+@csrf_exempt
+def stage_delay_reply(request):
+    """Public (token-protected) page behind the Reply button in the delay mail."""
+    token = request.POST.get('t') or request.GET.get('t') or ''
+    try:
+        p = _signing.loads(token, salt=DELAY_SALT, max_age=DELAY_LINK_MAX_AGE)
+        patient_id, cycle_key, stage_key = str(p.get('p') or ''), str(p.get('c') or ''), str(p.get('s') or '')
+    except _signing.BadSignature:
+        return _cancel_page("<h2>Link not valid</h2><div class='sub'>This link is invalid or has expired.</div>", 400)
+    info = _delay_row(patient_id, cycle_key, stage_key)
+    if not info:
+        return _cancel_page("<h2>Not found</h2><div class='sub'>This delay record no longer exists.</div>", 404)
+    error = ''
+    if request.method == 'POST':
+        reply = (request.POST.get('reply') or '').strip()
+        if not reply:
+            error = 'Please write your reply.'
+        else:
+            ok, msg, _mail = _save_delay_reply(patient_id, cycle_key, stage_key, reply, 'Administrator (email link)')
+            info = _delay_row(patient_id, cycle_key, stage_key)
+            return _cancel_page(f"<h2>Reply sent</h2><div class='msg good'>Your reply was saved and mailed to {_esc(info['requested_by'] or 'the person who reported it')}.</div>{_rows_html(_delay_rows(info))}")
+    prev = f"<div class='box'><b>Previous reply</b><div>{_esc(info['reply'])}</div></div>" if info['reply'] else ''
+    err_html = f"<div class='msg err'>{_esc(error)}</div>" if error else ''
+    inner = (
+        "<h2>Stage delayed</h2><div class='sub'>Write your reply — it is mailed to the person who recorded the reason.</div>"
+        + err_html + _rows_html(_delay_rows(info)) + prev +
+        f"<form method='post'><input type='hidden' name='t' value='{_esc(token)}'>"
+        "<label>Your reply</label><textarea name='reply' rows='4'></textarea>"
+        "<button class='ok' type='submit'>Send reply</button></form>")
+    return _cancel_page(inner)
+
+
+
+# ---- Revert to Telecalling mail: two buttons (Return to branch / Cancellation request) --------------
+# The Telecalling Team gets a mail with two buttons. Each opens a small public form (signed, expiring link):
+#   Return to branch      -> date + comment; saved to the DB + history log, mailed back to whoever reverted it
+#   Cancellation request  -> reason + remark; goes to the Administrator for approve / disapprove (existing flow)
+TELE_SALT = 'india-ivf-tele-action'
+
+
+def _send_revert_mail(request, data, ctx, invoice, patient_id, remarks, log_user, log_line):
+    def _num(x):
+        try:
+            return float(x or 0)
+        except (TypeError, ValueError):
+            return 0.0
+    req_email = str(data.get('requester_email') or '').strip().lower()
+    if '@' not in req_email:
+        req_email = ''
+    origin = str(data.get('origin') or '').strip().rstrip('/')
+    if not origin.startswith(('http://', 'https://')):
+        origin = request.build_absolute_uri('/').rstrip('/')
+    outstanding, collected = _num(ctx.get('outstanding')), _num(ctx.get('collected'))
+    token = _signing.dumps({
+        'i': invoice, 'p': patient_id, 'n': str(ctx.get('name') or '')[:120], 'c': str(ctx.get('centre') or '')[:120],
+        'k': str(ctx.get('pkg') or '')[:120], 'o': outstanding, 'l': collected, 'e': req_email, 'u': log_user, 'g': origin,
+    }, salt=TELE_SALT)
+    base = f"{origin}/api/tele-action?t={token}"
+    ret_url, can_url = base + "&a=return", base + "&a=cancel"
+    rows = [
+        ('Patient', f"{ctx.get('name') or '—'} ({patient_id or '—'})"),
+        ('Invoice', invoice),
+        ('Centre', ctx.get('centre') or '—'),
+        ('Package', ctx.get('pkg') or '—'),
+        ('Amount collected', f"₹{collected:,.0f}"),
+        ('Outstanding', f"₹{outstanding:,.0f}"),
+        ('Reverted by', log_user or '—'),
+    ]
+    if remarks:
+        rows.append(('Remarks', remarks))
+    subject = "[India IVF HMS] Patient reverted to Telecalling Team"
+    text = (f"A patient has been reverted to the Telecalling Team.\n\n{_rows_text(rows)}\n\n"
+            f"Return to branch     : {ret_url}\nCancellation request : {can_url}\n\n{log_line}\n\n— India IVF HMS")
+    html = (
+        "<div style='font-family:Segoe UI,Arial,sans-serif;max-width:560px'>"
+        "<h3 style='margin:0 0 6px;color:#9f1d52'>Patient reverted to Telecalling Team</h3>"
+        "<p style='margin:0 0 12px;color:#475569'>Please choose what happens next.</p>"
+        f"{_rows_html(rows)}"
+        "<p style='margin:18px 0 0'>"
+        f"<a href='{_esc(ret_url)}' style='background:#15803d;color:#fff;text-decoration:none;padding:10px 18px;border-radius:8px;font-weight:700;margin-right:10px;display:inline-block'>Return to branch</a>"
+        f"<a href='{_esc(can_url)}' style='background:#b91c1c;color:#fff;text-decoration:none;padding:10px 18px;border-radius:8px;font-weight:700;display:inline-block'>Cancellation request</a>"
+        "</p><p style='color:#94a3b8;font-size:12px;margin-top:16px'>The buttons open a form — nothing changes until you submit it.</p></div>")
+    lists = _get_notify_recipients()
+    if not lists['telecalling']:
+        return {'sent': 0, 'mode': _mail_mode(), 'note': 'No Telecalling Team email configured.'}
+    return _send_mail_raw(lists['telecalling'], subject, text, html)
+
+
+def _tele_return_branch(p, ret_date, comment, who, email):
+    ensure_aging_action_tables()
+    invoice, patient_id = p['i'], p.get('p') or ''
+    with connection.cursor() as cursor:
+        cursor.execute("""
+            INSERT INTO reports_agingworkflow (invoice, patient_id, state, reason, refund_amount, comment)
+            VALUES (%s, %s, 'Returned to Branch', '', NULL, %s)
+            ON DUPLICATE KEY UPDATE state = VALUES(state), reason = VALUES(reason),
+                                    refund_amount = VALUES(refund_amount), comment = VALUES(comment)
+        """, [invoice, patient_id, comment[:500]])
+        cursor.execute("SELECT id FROM reports_agingfollowup WHERE invoice = %s", [invoice])
+        if cursor.fetchone():
+            cursor.execute("UPDATE reports_agingfollowup SET status = 'Active' WHERE invoice = %s", [invoice])
+        else:
+            cursor.execute("""
+                INSERT INTO reports_agingfollowup (invoice, patient_id, status, remarks, referred_date, history_log)
+                VALUES (%s, %s, 'Active', '', NULL, '')
+            """, [invoice, patient_id])
+        text = f"Return to branch — Date: {ret_date.strftime('%d-%b-%y')}"
+        if comment:
+            text += f" — {comment}"
+        line = _fmt_log(who, text)
+        cursor.execute("""
+            INSERT INTO reports_agingaction (invoice, patient_id, action_type, to_value, log_line)
+            VALUES (%s, %s, 'tele_return_branch', '', %s)
+        """, [invoice, patient_id, line])
+    _push_notif(invoice, patient_id, line)
+    # mail back to whoever reverted the patient (Telecalling Team in cc)
+    lists = _get_notify_recipients()
+    to = [e for e in [p.get('e'), email] if e]
+    rows = [
+        ('Patient', f"{p.get('n') or '—'} ({patient_id or '—'})"),
+        ('Invoice', invoice),
+        ('Centre', p.get('c') or '—'),
+        ('Package', p.get('k') or '—'),
+        ('Returned on', ret_date.strftime('%d-%b-%Y')),
+        ('Done by', who),
+    ]
+    if comment:
+        rows.append(('Comment', comment))
+    subject = "Re: [India IVF HMS] Patient reverted to Telecalling Team — returned to branch"
+    mtext = f"The patient has been returned to the branch.\n\n{_rows_text(rows)}\n\n{line}\n\n— India IVF HMS"
+    mhtml = ("<div style='font-family:Segoe UI,Arial,sans-serif;max-width:560px'>"
+             "<h3 style='margin:0 0 6px;color:#15803d'>Patient returned to branch</h3>" + _rows_html(rows) + "</div>")
+    if to:
+        return _send_mail_raw(to, subject, mtext, mhtml, cc=lists['telecalling'])
+    return _send_mail_raw(lists['telecalling'], subject, mtext, mhtml)
+
+
+@csrf_exempt
+def tele_action(request):
+    """Public (token-protected) form behind the two buttons in the 'Revert to Telecalling' mail."""
+    token = request.POST.get('t') or request.GET.get('t') or ''
+    try:
+        p = _signing.loads(token, salt=TELE_SALT, max_age=CANCEL_LINK_MAX_AGE)
+        invoice = str(p.get('i') or '')
+    except _signing.BadSignature:
+        return _cancel_page("<h2>Link not valid</h2><div class='sub'>This link is invalid or has expired. Please use the Aging page instead.</div>", 400)
+    ensure_aging_action_tables()
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT state FROM reports_agingworkflow WHERE invoice = %s", [invoice])
+        r = cursor.fetchone()
+    state = r[0] if r else ''
+    rows = [
+        ('Patient', f"{p.get('n') or '—'} ({p.get('p') or '—'})"),
+        ('Invoice', invoice),
+        ('Centre', p.get('c') or '—'),
+        ('Package', p.get('k') or '—'),
+        ('Amount collected', f"₹{float(p.get('l') or 0):,.0f}"),
+        ('Outstanding', f"₹{float(p.get('o') or 0):,.0f}"),
+    ]
+    details = _rows_html(rows)
+    if state != 'With Telecalling':
+        return _cancel_page(f"<h2>Already handled</h2><div class='sub'>This patient is no longer waiting with the Telecalling Team (current state: {_esc(state or 'none')}).</div>{details}")
+
+    a = request.POST.get('a') or request.GET.get('a') or 'return'
+    if a not in ('return', 'cancel'):
+        a = 'return'
+    error = ''
+    name = (request.POST.get('name') or '').strip()[:80]
+    email = (request.POST.get('email') or '').strip().lower()[:190]
+    if email and not _re_log.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', email):
+        email = ''
+    comment = (request.POST.get('comment') or '').strip()[:500]
+    who = f"{name or 'Telecalling Team'} (email link)"
+
+    if request.method == 'POST':
+        if a == 'return':
+            try:
+                ret_date = _dt_log.strptime((request.POST.get('date') or '').strip(), '%Y-%m-%d').date()
+            except ValueError:
+                ret_date = None
+                error = 'Enter a valid date.'
+            if ret_date:
+                res = _tele_return_branch(p, ret_date, comment, who, email)
+                note = 'The branch has been informed by mail.' if res.get('sent') else 'Saved, but the mail could not be sent' + (f" ({_esc(res.get('error') or res.get('note') or '')})" if (res.get('error') or res.get('note')) else '.')
+                return _cancel_page(f"<h2>Returned to branch</h2><div class='msg good'>Saved in the history log. {note}</div>{details}")
+        else:
+            reason = (request.POST.get('reason') or '').strip()
+            if reason and reason not in AGING_CANCEL_REASONS:
+                reason = ''
+            if not comment:
+                error = 'Please add a remark for the Administrator.'
+            else:
+                ctx = {'name': p.get('n'), 'centre': p.get('c'), 'pkg': p.get('k'), 'outstanding': p.get('o'), 'collected': p.get('l')}
+                text = "Cancellation request (via Telecalling mail)"
+                if reason:
+                    text += f" — Reason: {reason}"
+                text += f" — {comment}"
+                line = _fmt_log(who, text)
+                with connection.cursor() as cursor:
+                    cursor.execute("""
+                        INSERT INTO reports_agingworkflow (invoice, patient_id, state, reason, refund_amount, comment)
+                        VALUES (%s, %s, 'Cancellation Requested', %s, NULL, %s)
+                        ON DUPLICATE KEY UPDATE state = VALUES(state), reason = VALUES(reason),
+                                                refund_amount = VALUES(refund_amount), comment = VALUES(comment)
+                    """, [invoice, p.get('p') or '', reason, comment])
+                    cursor.execute("""
+                        INSERT INTO reports_agingaction (invoice, patient_id, action_type, to_value, log_line)
+                        VALUES (%s, %s, 'tele_cancel_request', '', %s)
+                    """, [invoice, p.get('p') or '', line])
+                _push_notif(invoice, p.get('p') or '', line)
+                res = _send_cancel_request_mails(request, {'origin': p.get('g') or '', 'requester_email': email or p.get('e') or ''},
+                                                 ctx, invoice, p.get('p') or '', reason, comment, who)
+                note = 'The Administrator has been mailed for approval.' if res.get('sent') else 'Saved, but the mail could not be sent' + (f" ({_esc(res.get('error') or res.get('note') or '')})" if (res.get('error') or res.get('note')) else '.')
+                return _cancel_page(f"<h2>Cancellation request sent</h2><div class='msg good'>{note} You will be informed once it is approved or disapproved.</div>{details}")
+
+    err_html = f"<div class='msg err'>{_esc(error)}</div>" if error else ''
+    tok = _esc(token)
+    today = timezone.localdate().strftime('%Y-%m-%d')
+    switch = (f"<a href='?t={tok}&a=cancel' style='font-size:13px'>Cancellation request instead →</a>" if a == 'return'
+              else f"<a href='?t={tok}&a=return' style='font-size:13px'>Return to branch instead →</a>")
+    name_field = f"<label>Your name (optional)</label><input name='name' value='{_esc(name)}'>"
+    if a == 'return':
+        form = (
+            f"<div class='box'><b>Return to branch</b><form method='post'><input type='hidden' name='t' value='{tok}'><input type='hidden' name='a' value='return'>"
+            f"<label>Date</label><input type='date' name='date' value='{_esc(request.POST.get('date') or today)}' required>"
+            f"<label>Comment</label><textarea name='comment' rows='3'>{_esc(comment)}</textarea>{name_field}"
+            "<label>Your email (optional — to also get the confirmation)</label>"
+            f"<input name='email' value='{_esc(email)}'>"
+            "<button class='ok' type='submit'>Submit</button></form></div>")
+    else:
+        opts = "<option value=''>— Select —</option>" + "".join(
+            f"<option value='{_esc(x)}'{' selected' if x == request.POST.get('reason') else ''}>{_esc(x)}</option>" for x in AGING_CANCEL_REASONS)
+        form = (
+            f"<div class='box'><b>Cancellation request</b><form method='post'><input type='hidden' name='t' value='{tok}'><input type='hidden' name='a' value='cancel'>"
+            f"<label>Reason</label><select name='reason' style='width:100%;padding:9px 10px;border:1px solid #cbd5e1;border-radius:8px;font-size:14px'>{opts}</select>"
+            f"<label>Remark (goes to the Administrator)</label><textarea name='comment' rows='3' required>{_esc(comment)}</textarea>{name_field}"
+            "<label>Your email (optional — to get the decision mail)</label>"
+            f"<input name='email' value='{_esc(email)}'>"
+            "<button class='no' type='submit'>Send for approval</button></form></div>")
+    return _cancel_page(f"<h2>Reverted to Telecalling Team</h2><div class='sub'>Choose what happens with this patient.</div>{err_html}{details}{form}<p>{switch}</p>")
+
+
+# ---- In-app notifications for every new comment / history entry on the Aging page ---------------------
+# Each new history line (action, follow-up, email-link decision) is also written to reports_agingnotif.
+# The Aging page polls /api/aging_notifications/ and shows a bell + toast; clicking jumps to the patient's comment.
+def _ensure_notif_table():
+    with connection.cursor() as cursor:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS reports_agingnotif (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                invoice VARCHAR(100) NOT NULL,
+                patient_id VARCHAR(50) NOT NULL DEFAULT '',
+                text TEXT,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+
+def _push_notif(invoice, patient_id, text):
+    """Record a notification. Never raises — a failed notification must not break saving the comment."""
+    try:
+        _ensure_notif_table()
+        with connection.cursor() as cursor:
+            cursor.execute("INSERT INTO reports_agingnotif (invoice, patient_id, text) VALUES (%s, %s, %s)",
+                           [invoice, patient_id or '', text or ''])
+    except Exception:
+        pass
+
+
+@csrf_exempt
+def aging_notifications(request):
+    """GET -> {maxId, items: [{id, invoice, patientId, text, at}]} (newest first, last 25)."""
+    try:
+        _ensure_notif_table()
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT id, invoice, patient_id, text, created_at FROM reports_agingnotif ORDER BY id DESC LIMIT 25")
+            rows = cursor.fetchall()
+        items = [{'id': r[0], 'invoice': r[1], 'patientId': r[2], 'text': r[3] or '',
+                  'at': r[4].strftime('%Y-%m-%dT%H:%M:%S') if r[4] else ''} for r in rows]
+        return JsonResponse({'status': 'success', 'maxId': items[0]['id'] if items else 0, 'items': items})
     except Exception as e:
         return JsonResponse({'status': 'error', 'message': str(e)}, status=500)

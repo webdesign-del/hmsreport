@@ -20,8 +20,15 @@ export function middleware(request) {
   const { pathname } = request.nextUrl;
   const isApi = pathname.startsWith('/api/');
 
-  // Public: the login page and the login API.
-  if (pathname === '/login' || pathname.startsWith('/login/') || pathname.startsWith('/api/login')) {
+  // Public: the login page, the login API, and the e-mail Approve / Disapprove page (it is protected by a signed token).
+  if (
+    pathname === '/login' ||
+    pathname.startsWith('/login/') ||
+    pathname.startsWith('/api/login') ||
+    pathname.startsWith('/api/cancel-decision') ||
+    pathname.startsWith('/api/tele-action') ||
+    pathname.startsWith('/api/stage-delay-reply')
+  ) {
     return NextResponse.next();
   }
 

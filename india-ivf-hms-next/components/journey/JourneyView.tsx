@@ -20,6 +20,18 @@ const getImageUrl = (photoPath: string) => {
   return `https://indiaivf.website/${cleanPath}`;
 };
 
+// KYC (patient edit) page on the HMS site — shown under Compliances on the First Consult row.
+const patientKycUrl = (patientId: unknown): string => {
+  const id = String(patientId ?? "").trim();
+  return id ? `https://indiaivf.website/patients/edit/${encodeURIComponent(id)}` : "";
+};
+
+// Patient-wise page on the HMS site (opened from the Clinical Forms column when no clinical form is linked).
+const patientDetailsUrl = (patientId: unknown): string => {
+  const id = String(patientId ?? "").trim();
+  return id ? `https://indiaivf.website/patient_details/${encodeURIComponent(id)}` : "";
+};
+
 export default function JourneyView({ initialId = "" }: JourneyViewProps) {
   const [patientIdInput, setPatientIdInput] = useState(initialId || "");
   const [patientProfile, setPatientProfile] = useState<any>(null);
@@ -36,6 +48,7 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
     const role = getClientSession()?.role;
     setHideFinancials(hidesFinancials(role));
     setReadOnly(isReadOnlyRole(role));
+    setUserRole(role ?? null);
     // Embryologists work the lab side (Embryology Forms) — clinical/daycare forms aren't theirs.
     setHideClinicalForms(role === "embryologist");
   }, []);
@@ -47,6 +60,7 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
   // Track visibility toggles
   const [hiddenTracks, setHiddenTracks] = useState<Set<string>>(new Set());
   const [collapseDone, setCollapseDone] = useState(false);
+  const [stagesOpen, setStagesOpen] = useState(true); // whole "Clinical Journey Stages" card
 
   // 📅 DATE CHANGE INLINE POPOVER STATE
   const [editingStageIdx, setEditingStageIdx] = useState<number | null>(null);
@@ -82,8 +96,31 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
   // ⏱ STAGE DELAY REASONS — when Stimulation / Trigger / OPU runs past its ideal date the
   // counsellor records why (Financial / Medical / Personal). Saved reasons are keyed by
   // "<cycle>|<stage>"; the popup only opens for a stage that is actually Delayed.
-  const DELAY_REASONS = ["Financial Problem", "Medical Issues", "Personal Issues"] as const;
-  const [stageDelays, setStageDelays] = useState<Record<string, { reason: string; remarks: string }>>({});
+  const DELAY_REASONS = ["Financial Problem", "Medical Issues", "Personal Issues", "Other"] as const;
+  type StageDelayInfo = { reason: string; remarks: string; reply?: string; repliedBy?: string; repliedAt?: string };
+  const [stageDelays, setStageDelays] = useState<Record<string, StageDelayInfo>>({});
+  const [userRole, setUserRole] = useState<string | null>(null);
+  const [replyText, setReplyText] = useState("");
+  const [replyBusy, setReplyBusy] = useState(false);
+  const [delayNotice, setDelayNotice] = useState<{ tone: "ok" | "warn"; text: string } | null>(null);
+  const showDelayNotice = (n: { tone: "ok" | "warn"; text: string }) => {
+    setDelayNotice(n);
+    setTimeout(() => setDelayNotice(null), 7000);
+  };
+  const isAdminRole = userRole === "management" || userRole === "superadmin";
+  const mailNotice = (m: { sent?: number; mode?: string; error?: string; note?: string } | undefined, who: string) => {
+    if (!m) return;
+    if (m.error) showDelayNotice({ tone: "warn", text: `Saved, but the mail could not be sent: ${m.error}` });
+    else if (m.sent && m.mode === "console")
+      showDelayNotice({ tone: "warn", text: "Saved, but the mail was NOT delivered — SMTP settings are not saved yet (Aging page → ✉ Notification emails)." });
+    else if (m.sent) showDelayNotice({ tone: "ok", text: `✉ Mail sent to ${who}.` });
+    else showDelayNotice({ tone: "warn", text: `Saved. ${m.note || "No mail was sent."}` });
+  };
+  const sessionIdentity = () => {
+    const s = getClientSession() as { email?: string; username?: string; name?: string } | null;
+    const email = s?.email || s?.username || "";
+    return { user: s?.username || s?.name || "", email: email.includes("@") ? email : "" };
+  };
   const [delayModal, setDelayModal] = useState<{
     key: string;
     cycleKey: string;
@@ -100,9 +137,15 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
     try {
       const res = await fetch(`/api/stage-delay?patient_id=${encodeURIComponent(patientId)}`, { cache: "no-store" });
       const json = await res.json();
-      const map: Record<string, { reason: string; remarks: string }> = {};
+      const map: Record<string, StageDelayInfo> = {};
       (json.delays || []).forEach((d: any) => {
-        map[`${d.cycle_key}|${d.stage_key}`] = { reason: d.reason, remarks: d.remarks || "" };
+        map[`${d.cycle_key}|${d.stage_key}`] = {
+          reason: d.reason,
+          remarks: d.remarks || "",
+          reply: d.reply || "",
+          repliedBy: d.replied_by || "",
+          repliedAt: d.replied_at || "",
+        };
       });
       setStageDelays(map);
     } catch {
@@ -113,6 +156,7 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
   const openDelayModal = (m: NonNullable<typeof delayModal>) => {
     const saved = stageDelays[m.key];
     setDelayReason(saved?.reason || "");
+    setReplyText("");
     setDelayRemarks(saved?.remarks || "");
     setDelayError("");
     setDelayModal(m);
@@ -122,6 +166,10 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
     if (!delayModal) return;
     if (!delayReason) {
       setDelayError("Please select a reason.");
+      return;
+    }
+    if (delayReason === "Other" && !delayRemarks.trim()) {
+      setDelayError("Please describe the reason in the remarks.");
       return;
     }
     setDelaySaving(true);
@@ -138,12 +186,21 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
           remarks: delayRemarks.trim(),
           ideal_date: delayModal.idealISO,
           actual_date: delayModal.actualISO,
+          patient_name: patientProfile?.wife_name || "",
+          user: sessionIdentity().user,
+          requester_email: sessionIdentity().email,
+          role: userRole || "",
+          origin: typeof window !== "undefined" ? window.location.origin : "",
         }),
       });
       const data = await res.json();
       if (!res.ok || data.status !== "success") throw new Error(data.message || "Failed to save.");
-      setStageDelays((prev) => ({ ...prev, [delayModal.key]: { reason: delayReason, remarks: delayRemarks.trim() } }));
+      setStageDelays((prev) => ({
+        ...prev,
+        [delayModal.key]: { ...(prev[delayModal.key] || {}), reason: delayReason, remarks: delayRemarks.trim() },
+      }));
       setDelayModal(null);
+      mailNotice(data.mail, "the Administrator");
     } catch (e: any) {
       setDelayError(e?.message || "Failed to save.");
     } finally {
@@ -1012,18 +1069,34 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
 
         return (
         <div className="rounded-[14px] border border-border bg-surface shadow-card overflow-hidden">
-          <div className="border-b border-border px-5 py-4 flex justify-between items-center bg-surface-2">
-            <h3 className="font-bold text-sm">
-              Clinical Journey Stages &amp; Milestones
-              {ivfProcedures.length > 0 ? ` — ${catOf(ivfProcedures[0])}` : ""} ({stages.length}
-              {cycleGroups.length > 1 ? ` × ${cycleGroups.length} cycles` : ""})
+          <div
+            role="button"
+            tabIndex={0}
+            aria-expanded={stagesOpen}
+            onClick={() => setStagesOpen((o) => !o)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                setStagesOpen((o) => !o);
+              }
+            }}
+            title={stagesOpen ? "Click to collapse" : "Click to expand"}
+            className={`flex cursor-pointer select-none items-center justify-between bg-surface-2 px-5 py-4 hover:bg-surface ${stagesOpen ? "border-b border-border" : ""}`}
+          >
+            <h3 className="flex items-center gap-2 text-sm font-bold">
+              <span className="inline-block w-3 text-[11px] text-text-soft">{stagesOpen ? "▼" : "▶"}</span>
+              <span>
+                Clinical Journey Stages &amp; Milestones
+                {ivfProcedures.length > 0 ? ` — ${catOf(ivfProcedures[0])}` : ""} ({stages.length}
+                {cycleGroups.length > 1 ? ` × ${cycleGroups.length} cycles` : ""})
+              </span>
             </h3>
             <span className="rounded-full bg-green-soft px-2.5 py-1 text-[10px] font-bold uppercase tracking-wide text-green">
               ● Django Live Synced
             </span>
           </div>
 
-          <div className="overflow-x-auto">
+          <div className={`overflow-x-auto ${stagesOpen ? "" : "hidden"}`}>
             <table className="w-full text-left text-xs">
               <thead className="bg-surface border-b border-border font-semibold text-text-mid">
                 <tr>
@@ -1372,7 +1445,7 @@ return (
               className="inline-flex items-center gap-1 rounded-full border border-red-300 bg-red-100 px-2 py-0.5 text-[10px] font-bold uppercase text-red-700 transition hover:bg-red-200"
               title={readOnly ? "Delayed — click to view the reason" : "Delayed — click to record the reason"}
             >
-              ⚠ Delayed{savedDelay ? ` · ${savedDelay.reason}` : ""}
+              ⚠ Delayed{savedDelay ? ` · ${savedDelay.reason}` : ""}{savedDelay?.reply ? " · 💬" : ""}
             </button>
           ) : (
             <span className="inline-flex items-center gap-1 rounded-full border border-green-300 bg-green-100 px-2 py-0.5 text-[10px] font-bold uppercase text-green-700">
@@ -1432,6 +1505,17 @@ return (
                                 );
                               })}
                             </div>
+                          ) : stg.key === "First Consult" && patientDetailsUrl(patientProfile?.patient_id) ? (
+                            <a
+                              href={patientDetailsUrl(patientProfile?.patient_id)}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-1.5 rounded-full border border-[#1d4ed8] bg-[#2563eb] px-3 py-1 text-[11px] font-bold text-white shadow-sm transition-transform hover:scale-105"
+                              title="Open the patient's details page"
+                            >
+                              <span>👁</span>
+                              <span>Patient details</span>
+                            </a>
                           ) : (
                             <span className="text-text-soft italic text-[11px]">— No clinical form linked</span>
                           )}
@@ -1508,6 +1592,18 @@ return (
                           specific clinical day), not the generic procedure forms. */}
                       {!hiddenTracks.has("compliances") && (
                         <td className="p-3.5 text-center">
+                          {stg.key === "First Consult" && patientKycUrl(patientProfile?.patient_id) && (
+                            <a
+                              href={patientKycUrl(patientProfile?.patient_id)}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="mb-1.5 inline-flex items-center gap-1.5 rounded-full border border-[#1d4ed8] bg-[#2563eb] px-3 py-1 text-[11px] font-bold text-white shadow-sm transition-transform hover:scale-105"
+                              title="Open the patient's KYC page"
+                            >
+                              <span>🪪</span>
+                              <span>KYC</span>
+                            </a>
+                          )}
                           {concernForms.length > 0 ? (
                             <div className="flex flex-wrap justify-center gap-1.5">
                               {concernForms.map((cf: any, cfIdx: number) => (
@@ -1524,7 +1620,7 @@ return (
                                 </a>
                               ))}
                             </div>
-                          ) : (
+                          ) : stg.key === "First Consult" && patientKycUrl(patientProfile?.patient_id) ? null : (
                             <span className="text-text-soft text-[11px]">—</span>
                           )}
                         </td>
@@ -1680,6 +1776,16 @@ return (
       })()}
 
       {/* ⏱ DELAY REASON POPUP (counsellor) — only reachable from a Delayed stage badge */}
+      {delayNotice && (
+        <div
+          className={`fixed bottom-5 right-5 z-[70] max-w-sm rounded-lg px-4 py-3 text-xs font-semibold shadow-xl ${
+            delayNotice.tone === "ok" ? "bg-green-100 text-green-800" : "bg-amber-100 text-amber-800"
+          }`}
+        >
+          {delayNotice.text}
+        </div>
+      )}
+
       {delayModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
           <div className="w-full max-w-md rounded-2xl bg-white p-6 shadow-2xl">
@@ -1725,11 +1831,76 @@ return (
               value={delayRemarks}
               onChange={(e) => setDelayRemarks(e.target.value)}
               disabled={readOnly}
-              placeholder="Remarks (optional)"
+              placeholder={delayReason === "Other" ? "Describe the reason (required for Other)" : "Remarks (optional)"}
               rows={3}
               className="mt-3 w-full rounded-lg border border-border px-3 py-2 text-xs outline-none focus:border-primary"
             />
             {delayError && <p className="mt-2 text-xs font-semibold text-red-600">{delayError}</p>}
+
+            {stageDelays[delayModal.key]?.reply && (
+              <div className="mt-3 rounded-lg border border-primary/30 bg-primary-soft px-3 py-2 text-xs text-primary-dark">
+                <div className="mb-0.5 font-bold">
+                  💬 Administrator’s reply
+                  {stageDelays[delayModal.key]?.repliedBy ? ` · ${stageDelays[delayModal.key]?.repliedBy}` : ""}
+                  {stageDelays[delayModal.key]?.repliedAt ? ` · ${stageDelays[delayModal.key]?.repliedAt}` : ""}
+                </div>
+                <div className="whitespace-pre-line">{stageDelays[delayModal.key]?.reply}</div>
+              </div>
+            )}
+
+            {isAdminRole && stageDelays[delayModal.key] && (
+              <div className="mt-3 rounded-lg border border-border p-3">
+                <div className="mb-1 text-xs font-bold text-slate-700">Reply (Administrator)</div>
+                <textarea
+                  value={replyText}
+                  onChange={(e) => setReplyText(e.target.value)}
+                  rows={2}
+                  placeholder="Write your reply — it is mailed to the person who recorded this reason"
+                  className="w-full rounded-lg border border-border px-3 py-2 text-xs outline-none focus:border-primary"
+                />
+                <div className="mt-2 flex justify-end">
+                  <button
+                    type="button"
+                    disabled={replyBusy || !replyText.trim()}
+                    onClick={async () => {
+                      if (!delayModal) return;
+                      setReplyBusy(true);
+                      setDelayError("");
+                      try {
+                        const res = await fetch("/api/stage-delay", {
+                          method: "POST",
+                          headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify({
+                            op: "reply",
+                            patient_id: patientProfile?.patient_id,
+                            cycle_key: delayModal.cycleKey,
+                            stage_key: delayModal.stageKey,
+                            reply: replyText.trim(),
+                            user: sessionIdentity().user,
+                            role: userRole || "",
+                          }),
+                        });
+                        const data = await res.json();
+                        if (!res.ok || data.status !== "success") throw new Error(data.message || "Could not send the reply.");
+                        setStageDelays((prev) => ({
+                          ...prev,
+                          [delayModal.key]: { ...(prev[delayModal.key] || { reason: "", remarks: "" }), reply: data.reply, repliedBy: data.repliedBy, repliedAt: "just now" },
+                        }));
+                        setReplyText("");
+                        mailNotice(data.mail, "the person who recorded the reason");
+                      } catch (e: any) {
+                        setDelayError(e?.message || "Could not send the reply.");
+                      } finally {
+                        setReplyBusy(false);
+                      }
+                    }}
+                    className="rounded-lg bg-primary px-3 py-1.5 text-xs font-semibold text-white hover:bg-primary-dark disabled:opacity-50"
+                  >
+                    {replyBusy ? "Sending…" : "Send reply"}
+                  </button>
+                </div>
+              </div>
+            )}
 
             <div className="mt-4 flex justify-end gap-2">
               <button

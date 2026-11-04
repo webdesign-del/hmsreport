@@ -112,6 +112,9 @@ export interface AgingPatient {
   daysOverdue: number;
   lastFu: string;
   referred: string;
+  nextFu?: string;
+  fuOverdue?: boolean;
+  fuOverdueDays?: number;
   status: string;
   invoice: string;
   history: string;
@@ -126,6 +129,10 @@ export interface AgingPatient {
   requestReason?: string;
   refundAmount?: number | null;
   requestComment?: string;
+  centreChangeState?: string;
+  centreChangeTo?: string;
+  centreChangeReason?: string;
+  centreChangeBy?: string;
 }
 
 export interface Donor {

@@ -1,5 +1,6 @@
 export interface ClientSession {
   username: string;
+  email?: string;
   name: string;
   role: string;
   centerId?: number | null;

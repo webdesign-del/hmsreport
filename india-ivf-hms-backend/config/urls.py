@@ -54,5 +54,10 @@ urlpatterns = [
     path('api/get_stage_delays/', views.get_stage_delays, name='get_stage_delays'),
     path('api/save_aging_action/', views.save_aging_action, name='save_aging_action'),
     path('api/notify_recipients/', views.notify_recipients, name='notify_recipients'),
+    path('api/centre_list/', views.centre_list, name='centre_list'),
+    path('api/cancel_decision/', views.cancel_decision, name='cancel_decision'),
+    path('api/tele_action/', views.tele_action, name='tele_action'),
+    path('api/aging_notifications/', views.aging_notifications, name='aging_notifications'),
+    path('api/stage_delay_reply/', views.stage_delay_reply, name='stage_delay_reply'),
     path('api/mail_settings/', views.mail_settings, name='mail_settings'),
 ]

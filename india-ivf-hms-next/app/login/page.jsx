@@ -51,6 +51,7 @@ const res = await fetch('/api/login/', {
         // Save Session to LocalStorage & Middleware Cookie
         const sessionPayload = {
           username: data.user?.username || username,
+          email: data.user?.email || (username.includes('@') ? username : ''),
           name: data.user?.name || username,
           role: targetRole,
           centerId: data.user?.center_id ?? null,

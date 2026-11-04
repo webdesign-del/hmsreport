@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { TODAY, fmtDate, fmtINR } from "@/lib/format";
 import { FY_LABELS, FY_MONTHS } from "@/lib/seed-data";
@@ -68,7 +68,7 @@ function statusBadgeClass(status: string): string {
   }
 }
 
-type ActionKind = "status" | "centre" | "revert" | "cancel" | "review";
+type ActionKind = "status" | "centre" | "revert" | "cancel" | "review" | "centre_review" | "likely";
 
 function requestBadgeClass(state: string): string {
   switch (state) {
@@ -76,10 +76,12 @@ function requestBadgeClass(state: string): string {
       return "border-amber-300 bg-amber-100 text-amber-800";
     case "Cancellation Approved":
       return "border-red-300 bg-red-100 text-red-700";
+    case "With Telecalling":
     case "With Telecalling (Megha)":
     case "Forwarded to Megha":
       return "border-blue-300 bg-blue-100 text-blue-800";
     case "ReActive – Returned to Branch":
+    case "Returned to Branch":
       return "border-green-300 bg-green-100 text-green-700";
     default:
       return "border-border bg-surface-2 text-text-mid";
@@ -91,10 +93,12 @@ function RecipientEditor({
   title,
   list,
   onChange,
+  canRemove = false,
 }: {
   title: string;
   list: string[];
   onChange: (email: string, op: "add" | "remove") => Promise<string | null>;
+  canRemove?: boolean;
 }) {
   const [val, setVal] = useState("");
   const [err, setErr] = useState("");
@@ -121,9 +125,11 @@ function RecipientEditor({
         {list.map((em) => (
           <span key={em} className="inline-flex items-center gap-1 rounded-full border border-border bg-surface px-2.5 py-0.5 text-[11.5px] font-semibold text-text-mid">
             {em}
-            <button type="button" onClick={() => onChange(em, "remove")} className="text-text-soft hover:text-red" title="Remove">
-              ✕
-            </button>
+            {canRemove && (
+              <button type="button" onClick={() => onChange(em, "remove")} className="text-text-soft hover:text-red" title="Remove">
+                ✕
+              </button>
+            )}
           </span>
         ))}
       </div>
@@ -181,6 +187,7 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
   const [followUpTarget, setFollowUpTarget] = useState<AgingPatient | null>(null);
   const [followUpStatus, setFollowUpStatus] = useState<string>(FOLLOWUP_STATUSES[0]);
   const [followUpRemarks, setFollowUpRemarks] = useState("");
+  const [followUpDate, setFollowUpDate] = useState("");
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState("");
 
@@ -198,6 +205,18 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
   const [stReason, setStReason] = useState("");
   // change-centre popup
   const [toCentre, setToCentre] = useState("");
+  const [allCentres, setAllCentres] = useState<string[]>([]);
+  const [ccDecision, setCcDecision] = useState<"approved" | "rejected">("approved");
+  const [ccCentre, setCcCentre] = useState("");
+  useEffect(() => {
+    // Every centre — the page's own data is scoped to the user's centre, which would leave the picker empty.
+    fetch("/api/centre-list", { cache: "no-store" })
+      .then((r) => r.json())
+      .then((d) => {
+        if (d && d.status === "success" && Array.isArray(d.centres)) setAllCentres(d.centres.map((c: { name: string }) => c.name));
+      })
+      .catch(() => {});
+  }, []);
   const [centreReason, setCentreReason] = useState("");
   // shared
   const [actRemarks, setActRemarks] = useState("");
@@ -209,16 +228,30 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
   const [refundAmt, setRefundAmt] = useState("");
 
   // ---- Email notifications: Admin gets cancellation requests / decisions, Telecalling gets reverts ----
+  const sessionEmail = () => {
+    const s = getClientSession() as { email?: string; username?: string } | null;
+    const e = s?.email || s?.username || "";
+    return e.includes("@") ? e : "";
+  };
   const sessionUser = () => {
     const s = getClientSession();
     return s?.username || s?.name || "";
   };
-  const [recipients, setRecipients] = useState<{ admin: string[]; telecalling: string[] }>({ admin: [], telecalling: [] });
+  const [recipients, setRecipients] = useState<{ admin: string[]; telecalling: string[]; accountant: string[] }>({ admin: [], telecalling: [], accountant: [] });
   const [mailSettingsOpen, setMailSettingsOpen] = useState(false);
   const [notice, setNotice] = useState<{ tone: "ok" | "warn"; text: string } | null>(null);
+  // ---- Comment notifications (bell + toast); click jumps to the patient's comment ----
+  type Notif = { id: number; invoice: string; patientId: string; text: string; at: string };
+  const [notifs, setNotifs] = useState<Notif[]>([]);
+  const [unread, setUnread] = useState(0);
+  const [notifOpen, setNotifOpen] = useState(false);
+  const [toast, setToast] = useState<Notif | null>(null);
+  const [pendingJump, setPendingJump] = useState<string | null>(null);
+  const [highlight, setHighlight] = useState<string | null>(null);
+  const lastNotifId = useRef<number | null>(null);
   const [mailMode, setMailMode] = useState<"smtp" | "console" | null>(null);
   const [fromEmail, setFromEmail] = useState("");
-  const [smtp, setSmtp] = useState({ host: "smtp.gmail.com", port: "587", useTls: true, user: "", password: "", fromEmail: "" });
+  const [smtp, setSmtp] = useState({ host: "smtp.gmail.com", port: "587", useTls: true, verifySsl: true, user: "", password: "", fromEmail: "" });
   const [smtpPwSet, setSmtpPwSet] = useState(false);
   const [smtpBusy, setSmtpBusy] = useState(false);
   const [smtpMsg, setSmtpMsg] = useState<{ tone: "ok" | "warn"; text: string } | null>(null);
@@ -231,7 +264,7 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
       .then((r) => r.json())
       .then((d) => {
         if (d && d.status === "success") {
-          setRecipients({ admin: d.admin || [], telecalling: d.telecalling || [] });
+          setRecipients({ admin: d.admin || [], telecalling: d.telecalling || [], accountant: d.accountant || [] });
           setMailMode(d.mailMode === "smtp" ? "smtp" : d.mailMode === "console" ? "console" : null);
           setFromEmail(d.fromEmail || "");
         }
@@ -248,6 +281,7 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
         host: String(d.host),
         port: String(d.port || 587),
         useTls: d.useTls !== false,
+        verifySsl: d.verifySsl !== false,
         user: String(d.user || ""),
         password: "",
         fromEmail: String(d.fromEmail || ""),
@@ -280,7 +314,7 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
       if (!res.ok || d.status !== "success") {
         setSmtpMsg({ tone: "warn", text: d.message || "Could not save the mail settings." });
       } else {
-        if (clear) setSmtp({ host: "smtp.gmail.com", port: "587", useTls: true, user: "", password: "", fromEmail: "" });
+        if (clear) setSmtp({ host: "smtp.gmail.com", port: "587", useTls: true, verifySsl: true, user: "", password: "", fromEmail: "" });
         applySmtp(d);
         if (clear) setSmtpPwSet(false);
         setSmtpMsg({ tone: "ok", text: clear ? "Saved mail settings removed." : "Mail settings saved. Use “Send test mail” to check them." });
@@ -319,16 +353,16 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
     }
   }
 
-  async function changeRecipient(kind: "admin" | "telecalling", email: string, op: "add" | "remove"): Promise<string | null> {
+  async function changeRecipient(kind: "admin" | "telecalling" | "accountant", email: string, op: "add" | "remove"): Promise<string | null> {
     try {
       const res = await fetch("/api/notify-recipients", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ kind, email, op }),
+        body: JSON.stringify({ kind, email, op, role }),
       });
       const d = await res.json();
       if (!res.ok || d.status !== "success") return d.message || "Could not save the email.";
-      setRecipients({ admin: d.admin || [], telecalling: d.telecalling || [] });
+      setRecipients({ admin: d.admin || [], telecalling: d.telecalling || [], accountant: d.accountant || [] });
       return null;
     } catch {
       return "Could not reach the server.";
@@ -340,7 +374,7 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
     if (!action) return null;
     if (action.kind === "revert") return revMode === "revert" ? "telecalling" : revMode === "cancellation_request" ? "admin" : null;
     if (action.kind === "cancel") return "admin";
-    if (action.kind === "review") return reviewDecision === "approved" ? "admin" : reviewRoute === "forward_megha" ? "telecalling" : "admin";
+    if (action.kind === "review") return reviewDecision === "approved" ? null : reviewRoute === "forward_megha" ? "telecalling" : null;
     return null;
   }
 
@@ -350,6 +384,10 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
     setRole(getClientSession()?.role ?? null);
   }, []);
   const readOnly = isReadOnlyRole(role);   // "View Only" workspace: look, don't touch
+  // Accounts / Management change a centre directly and approve requests; everyone else can only request.
+  const isFinance = role === "accounts" || role === "management" || role === "superadmin";
+  // Accounts only REVIEWS requests; Management / Superadmin may also change a centre directly.
+  const canChangeDirect = role === "management" || role === "superadmin";
   const canApprove = !readOnly && (!role || role === "management" || role === "superadmin");
 
   function openAction(kind: ActionKind, p: AgingPatient) {
@@ -359,9 +397,15 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
     if (kind === "status") {
       setStMode(p.statusOverride === "Likely Cancellation" ? "likely_cancellation" : "auto");
       setStReason(p.statusReason || "");
+    } else if (kind === "likely") {
+      setStMode("likely_cancellation");
+      setStReason(p.statusOverride === "Likely Cancellation" ? p.statusReason || "" : "");
     } else if (kind === "centre") {
       setToCentre("");
       setCentreReason("");
+    } else if (kind === "centre_review") {
+      setCcDecision("approved");
+      setCcCentre(p.centreChangeTo || "");
     } else if (kind === "revert") {
       setRevMode("revert");
       setStReason("");
@@ -384,11 +428,20 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
       patient_id: p.id,
       remarks: actRemarks.trim(),
       user: sessionUser(),
+      requester_email: sessionEmail(),
+      origin: typeof window !== "undefined" ? window.location.origin : "",
+      role: role || "",
       // context for the notification email
-      ctx: { name: p.name, centre: p.salesCentre || p.centre, pkg: p.pkg, outstanding: p.incGst - paymentsTotal(p) },
+      ctx: { name: p.name, centre: p.salesCentre || p.centre, pkg: p.pkg, outstanding: p.incGst - paymentsTotal(p), collected: paymentsTotal(p) },
     };
 
-    if (kind === "status") {
+    if (kind === "likely") {
+      if (!stReason) {
+        setActError("Select a cancellation reason.");
+        return;
+      }
+      payload = { ...payload, kind: "status", mode: "likely_cancellation", reason: stReason };
+    } else if (kind === "status") {
       const needsReason = stMode === "likely_cancellation" || p.autoStatus === "Delayed";
       if (needsReason && !stReason) {
         setActError(stMode === "likely_cancellation" ? "Select a cancellation reason." : "Select a delay reason.");
@@ -399,13 +452,14 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
       if (!toCentre) return setActError("Select the new centre.");
       if (!centreReason.trim()) return setActError("Reason is required.");
       payload = { ...payload, kind: "change_centre", from_centre: p.salesCentre || p.centre, to_centre: toCentre, reason: centreReason.trim() };
+    } else if (kind === "centre_review") {
+      payload = { ...payload, kind: "review_centre_change", decision: ccDecision, to_centre: ccDecision === "approved" ? ccCentre : "" };
     } else if (kind === "revert") {
-      if (revMode === "cancellation_request" && !stReason) return setActError("Select a cancellation reason.");
-      payload = { ...payload, kind: "revert_tele", mode: revMode, reason: revMode === "cancellation_request" ? stReason : "" };
+      payload = { ...payload, kind: "revert_tele", mode: "revert", reason: "" };
     } else if (kind === "cancel") {
       if (!stReason) return setActError("Select a cancellation reason.");
       payload = { ...payload, kind: "direct_cancellation", reason: stReason };
-    } else {
+    } else if (kind === "review") {
       if (reviewDecision === "approved") {
         const amt = Number(refundAmt);
         if (refundAmt.trim() === "" || !Number.isFinite(amt) || amt < 0) return setActError("Enter a valid refund amount.");
@@ -441,15 +495,26 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
           if (x.invoice !== p.invoice) return x;
           // newest entry on top
           const history = logLine ? (x.history ? `${logLine}\n${x.history}` : logLine) : x.history;
-          if (kind === "status") {
+          if (kind === "status" || kind === "likely") {
             return {
               ...x,
               history,
-              statusOverride: stMode === "likely_cancellation" ? "Likely Cancellation" : "",
+              statusOverride: kind === "likely" || stMode === "likely_cancellation" ? "Likely Cancellation" : "",
               statusReason: String(payload.reason || ""),
             };
           }
-          if (kind === "centre") return { ...x, history, salesCentre: String(payload.to_centre) };
+          if (kind === "centre" || kind === "centre_review") {
+            const cc = data.centreChange as { state?: string; to?: string; reason?: string; by?: string } | undefined;
+            return {
+              ...x,
+              history,
+              salesCentre: data.salesCentre ? String(data.salesCentre) : x.salesCentre,
+              centreChangeState: cc?.state || "",
+              centreChangeTo: cc?.to || "",
+              centreChangeReason: cc?.reason || "",
+              centreChangeBy: cc?.by || "",
+            };
+          }
           if (kind === "revert" || kind === "cancel" || kind === "review") {
             return {
               ...x,
@@ -478,11 +543,20 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
     setFollowUpTarget(p);
     setFollowUpStatus((FOLLOWUP_STATUSES as readonly string[]).includes(p.status) ? p.status : FOLLOWUP_STATUSES[0]);
     setFollowUpRemarks("");
+    setFollowUpDate("");
     setSaveError("");
   }
 
   async function submitFollowUp() {
     if (!followUpTarget) return;
+    if (!followUpRemarks.trim()) {
+      setSaveError("Please write the follow-up remarks.");
+      return;
+    }
+    if (!followUpDate) {
+      setSaveError("Select the next follow-up date.");
+      return;
+    }
     setSaving(true);
     setSaveError("");
     try {
@@ -493,7 +567,9 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
           invoice: followUpTarget.invoice,
           patient_id: followUpTarget.id,
           status: followUpStatus,
+          followup_only: true,
           remarks: followUpRemarks.trim(),
+          next_date: followUpDate,
           user: sessionUser(),
         }),
       });
@@ -507,9 +583,10 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
           p.invoice === followUpTarget.invoice
             ? {
                 ...p,
-                status: followUpStatus,
                 lastFu: TODAY,
-                referred: followUpStatus === "Revert to Telecaller team" ? TODAY : p.referred,
+                nextFu: followUpDate,
+                fuOverdue: false,
+                fuOverdueDays: 0,
                 history: logLine ? (p.history ? `${logLine}\n${p.history}` : logLine) : p.history,
               }
             : p
@@ -530,7 +607,10 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
     if (bucket !== null) list = list.filter((p) => bucketIdx(p.daysOverdue) === bucket);
     list = list.filter((p) => inDateRange(p.lastFu, range, single, from, to));
     const q = search.trim().toLowerCase();
-    if (q) list = list.filter((p) => p.name.toLowerCase().includes(q) || p.id.toLowerCase().includes(q));
+    if (q)
+      list = list.filter((p) =>
+        [p.name, p.id, p.invoice].some((v) => String(v ?? "").toLowerCase().includes(q))
+      );
     return list;
   }, [localPatients, bucket, range, single, from, to, search]);
 
@@ -543,6 +623,83 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
   const pageStart = (safePage - 1) * pageSize;
   const paged = filtered.slice(pageStart, pageStart + pageSize);
 
+  // Poll for new comments. The first response only sets the baseline, so old comments are not "new".
+  useEffect(() => {
+    let stop = false;
+    async function poll() {
+      try {
+        const res = await fetch("/api/aging-notifications", { cache: "no-store" });
+        const d = await res.json();
+        if (stop || !res.ok || d.status !== "success") return;
+        const items: Notif[] = d.items || [];
+        setNotifs(items);
+        const prev = lastNotifId.current;
+        if (prev === null) {
+          lastNotifId.current = d.maxId || 0;
+        } else if ((d.maxId || 0) > prev) {
+          const fresh = items.filter((n) => n.id > prev);
+          lastNotifId.current = d.maxId;
+          setUnread((u) => u + fresh.length);
+          if (fresh.length) setToast(fresh[0]);
+        }
+      } catch {
+        /* ignore - try again on the next tick */
+      }
+    }
+    poll();
+    const t = setInterval(poll, 15000);
+    return () => {
+      stop = true;
+      clearInterval(t);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(null), 9000);
+    return () => clearTimeout(t);
+  }, [toast]);
+
+  // Jump to a patient's comment: clear filters if needed, open the right page, scroll to the history cell.
+  useEffect(() => {
+    if (!pendingJump) return;
+    const idx = filtered.findIndex((p) => p.invoice === pendingJump);
+    const noFilters = bucket === null && !search && range === "all";
+    if (idx < 0) {
+      if (noFilters) {
+        setPendingJump(null);
+        setNotice({ tone: "warn", text: "This patient is not in the Aging list (the comment was saved)." });
+      }
+      return;
+    }
+    const target = Math.floor(idx / pageSize) + 1;
+    if (target !== safePage) {
+      setPage(target);
+      return;
+    }
+    const row = document.getElementById(`aging-row-${pendingJump}`);
+    if (!row) return;
+    row.scrollIntoView({ behavior: "smooth", block: "center" });
+    (row.querySelector("[data-history]") as HTMLElement | null)?.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
+    setHighlight(pendingJump);
+    setPendingJump(null);
+    setTimeout(() => setHighlight(null), 5000);
+  }, [pendingJump, filtered, safePage, pageSize, bucket, search, range]);
+
+  function goToComment(n: Notif) {
+    setNotifOpen(false);
+    setToast(null);
+    setBucket(null);
+    setSearch("");
+    setRange("all");
+    setPendingJump(n.invoice);
+  }
+
+  function notifName(n: Notif): string {
+    const p = localPatients.find((x) => x.invoice === n.invoice);
+    return p?.name || n.patientId || n.invoice;
+  }
+
   return (
     <div className="rounded-[14px] border border-border bg-surface shadow-card">
       <div className="flex flex-wrap items-center gap-2.5 border-b border-border-soft px-[18px] py-[15px]">
@@ -550,6 +707,43 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
           Aging Patient List <span className="font-normal text-text-soft">· {filtered.length} record{filtered.length !== 1 ? "s" : ""}</span>
         </div>
         <div className="ml-auto flex flex-wrap items-center gap-2">
+          <div className="relative">
+            <button
+              type="button"
+              onClick={() => {
+                setNotifOpen((o) => !o);
+                setUnread(0);
+              }}
+              className="relative rounded-[8px] border border-border px-2.5 py-1.5 text-[11.5px] font-semibold text-text-mid hover:border-primary hover:text-primary"
+              title="New comments"
+            >
+              🔔 Comments
+              {unread > 0 && (
+                <span className="absolute -right-1.5 -top-1.5 min-w-[17px] rounded-full bg-red px-1 text-center text-[10px] font-bold leading-[17px] text-white">
+                  {unread}
+                </span>
+              )}
+            </button>
+            {notifOpen && (
+              <div className="absolute right-0 z-40 mt-1.5 max-h-[360px] w-[360px] overflow-y-auto rounded-[10px] border border-border bg-surface p-1.5 shadow-card">
+                {notifs.length === 0 && <div className="px-3 py-4 text-center text-[11.5px] text-text-soft">No comments yet.</div>}
+                {notifs.map((n) => (
+                  <button
+                    key={n.id}
+                    type="button"
+                    onClick={() => goToComment(n)}
+                    className="block w-full rounded-[8px] px-3 py-2 text-left hover:bg-surface-2"
+                  >
+                    <div className="flex items-center gap-2 text-[11.5px] font-semibold text-primary-dark">
+                      <span className="truncate">{notifName(n)}</span>
+                      <span className="ml-auto shrink-0 text-[10.5px] font-normal text-text-soft">{n.at ? new Date(n.at).toLocaleString() : ""}</span>
+                    </div>
+                    <div className="mt-0.5 line-clamp-2 text-[11.5px] leading-snug text-text-mid">{n.text}</div>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
           {!readOnly && (
           <button
             type="button"
@@ -588,6 +782,30 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
           )}
         </div>
       </div>
+
+      {toast && (
+        <button
+          type="button"
+          onClick={() => goToComment(toast)}
+          className="fixed bottom-5 right-5 z-50 w-[340px] rounded-[12px] border border-primary bg-surface p-3 text-left shadow-card"
+        >
+          <div className="flex items-center gap-2 text-[11.5px] font-semibold text-primary-dark">
+            🔔 New comment · {notifName(toast)}
+            <span
+              role="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                setToast(null);
+              }}
+              className="ml-auto text-text-soft hover:text-text"
+            >
+              ✕
+            </span>
+          </div>
+          <div className="mt-1 line-clamp-3 text-[11.5px] leading-snug text-text-mid">{toast.text}</div>
+          <div className="mt-1 text-[10.5px] text-primary">Click to open the comment →</div>
+        </button>
+      )}
 
       {notice && (
         <div
@@ -705,6 +923,7 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
               <th>Follow-up Status</th>
               <th>Date Referred to Tele</th>
               <th>Last Update Date</th>
+              <th>Next Follow-up Date</th>
               <th>Complete History Log</th>
               <th>Action</th>
             </tr>
@@ -712,7 +931,7 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
           <tbody>
             {filtered.length === 0 && (
               <tr>
-                <td colSpan={26 + (centresOpen ? 3 : 1) + fyColCount} className="text-center text-text-soft">
+                <td colSpan={27 + (centresOpen ? 3 : 1) + fyColCount} className="text-center text-text-soft">
                   No records match the current filters.
                 </td>
               </tr>
@@ -725,7 +944,11 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
               const inFy2627 = p.signup >= "2026-04-01";
               const balFy2627 = inFy2627 ? totalOut : 0;
               return (
-                <tr key={`${p.id}-${p.invoice || i}`}>
+                <tr
+                  key={`${p.id}-${p.invoice || i}`}
+                  id={`aging-row-${p.invoice}`}
+                  className={highlight === p.invoice ? "[&>td]:!bg-amber-100" : undefined}
+                >
                   <td className="sticky-l" style={{ width: 110, minWidth: 110, maxWidth: 110 }}>{fmtDate(p.signup)}</td>
                   <td className="sticky-l2" style={{ width: 150, minWidth: 150, maxWidth: 150 }}>
                     <Link href={`/journey?id=${p.id}`} className="iic-link">
@@ -744,7 +967,15 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
                   <td>{pkgFY(p.signup)}</td>
                   <td>{p.pkg}</td>
                   <td>{p.desc}</td>
-                  <td>{p.centre}</td>
+                  <td>
+                    {p.centre}
+                    {p.centreChangeState === "Requested" && (
+                      <span className="mt-0.5 block text-[10.5px] font-semibold text-amber-700">⏳ → {p.centreChangeTo} (awaiting Accounts)</span>
+                    )}
+                    {p.centreChangeState === "Rejected" && (
+                      <span className="mt-0.5 block text-[10.5px] font-semibold text-red">Centre change not approved</span>
+                    )}
+                  </td>
                   {centresOpen && <td>{p.salesCentre || p.centre}</td>}
                   {centresOpen && <td>{p.centre}</td>}
                   <td>Tax Invoice</td>
@@ -811,7 +1042,7 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
                     {p.requestState ? (
                       <div title={p.requestComment || ""}>
                         <span className={`inline-flex rounded-full border px-2.5 py-0.5 text-[10px] font-bold uppercase ${requestBadgeClass(p.requestState)}`}>
-                          {p.requestState}
+                          {p.requestState.replace(" (Megha)", "")}
                         </span>
                         {p.requestReason && (
                           <span className="mt-0.5 block text-[10.5px] font-semibold text-text-soft">{p.requestReason}</span>
@@ -836,7 +1067,21 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
                   <td>{p.status}</td>
                   <td>{fmtDate(p.referred)}</td>
                   <td>{fmtDate(p.lastFu)}</td>
-                  <td className="min-w-[300px] max-w-[360px] whitespace-normal">
+                  <td>
+                    {p.nextFu ? (
+                      <div className="flex flex-col items-start gap-1">
+                        <span>{fmtDate(p.nextFu)}</span>
+                        {p.fuOverdue && (
+                          <span className="rounded-full border border-red-300 bg-red-100 px-2 py-0.5 text-[10.5px] font-bold text-red-700">
+                            Overdue{p.fuOverdueDays ? ` · ${p.fuOverdueDays}d` : ""}
+                          </span>
+                        )}
+                      </div>
+                    ) : (
+                      <span className="text-text-soft">—</span>
+                    )}
+                  </td>
+                  <td data-history className="min-w-[300px] max-w-[360px] whitespace-normal">
                     {p.history ? (
                       <div className="max-h-40 space-y-1.5 overflow-y-auto text-[11.5px] leading-snug">
                         {p.history.split("\n").filter(Boolean).map((line, i) => (
@@ -851,16 +1096,25 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
                     {readOnly ? (
                       <span className="text-text-soft">—</span>
                     ) : (
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        const r = e.currentTarget.getBoundingClientRect();
-                        setMenu({ p, right: Math.max(8, window.innerWidth - r.right), top: r.bottom + 4 });
-                      }}
-                      className="rounded-[8px] bg-primary px-2.5 py-1 text-[11px] font-semibold text-white transition-colors hover:bg-primary-dark"
-                    >
-                      Action ▾
-                    </button>
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          const r = e.currentTarget.getBoundingClientRect();
+                          setMenu({ p, right: Math.max(8, window.innerWidth - r.right), top: r.bottom + 4 });
+                        }}
+                        className="rounded-[8px] bg-primary px-2.5 py-1 text-[11px] font-semibold text-white transition-colors hover:bg-primary-dark"
+                      >
+                        Action ▾
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => openFollowUp(p)}
+                        className="rounded-[8px] border border-primary px-2.5 py-1 text-[11px] font-semibold text-primary transition-colors hover:bg-primary-soft"
+                      >
+                        Follow-up
+                      </button>
+                    </div>
                     )}
                   </td>
                 </tr>
@@ -933,25 +1187,22 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
               {followUpTarget.id} · Invoice {followUpTarget.invoice || "—"}
             </div>
 
-            <label className="mb-1 block text-[11.5px] font-semibold text-text-mid">Current Status</label>
-            <select
-              value={followUpStatus}
-              onChange={(e) => setFollowUpStatus(e.target.value)}
+            <label className="mb-1 block text-[11.5px] font-semibold text-text-mid">Next follow-up date</label>
+            <input
+              type="date"
+              value={followUpDate}
+              min={TODAY}
+              onChange={(e) => setFollowUpDate(e.target.value)}
               className="mb-3 w-full rounded-[8px] border border-border bg-surface px-3 py-2 text-[12.5px] outline-none focus:border-primary"
-            >
-              {FOLLOWUP_STATUSES.map((s) => (
-                <option key={s} value={s}>
-                  {s}
-                </option>
-              ))}
-            </select>
+            />
+            <div className="-mt-2 mb-3 text-[11px] text-text-soft">If nothing happens on this patient by this date, it shows as Overdue in the list.</div>
 
             <label className="mb-1 block text-[11.5px] font-semibold text-text-mid">Remarks</label>
             <textarea
               value={followUpRemarks}
               onChange={(e) => setFollowUpRemarks(e.target.value)}
               rows={3}
-              placeholder="Add context — call logs, patient request, reason for status…"
+              placeholder="Add the follow-up — call details, patient response, next step…"
               className="mb-3 w-full resize-none rounded-[8px] border border-border bg-surface px-3 py-2 text-[12.5px] outline-none focus:border-primary"
             />
 
@@ -994,20 +1245,24 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
             onClick={(e) => e.stopPropagation()}
           >
             {[
-              { label: "🏢 Change Centre", onClick: () => openAction("centre", menu.p) },
+              ...(menu.p.centreChangeState === "Requested" && isFinance
+                ? [{ label: "✅ Review centre change request", onClick: () => openAction("centre_review", menu.p) }]
+                : []),
+              ...(menu.p.centreChangeState === "Requested" && !isFinance
+                ? [{ label: "⏳ Centre change awaiting Accounts", onClick: () => setMenu(null) }]
+                : []),
+              ...(canChangeDirect
+                ? [{ label: "🏢 Change Centre", onClick: () => openAction("centre", menu.p) }]
+                : []),
+              ...(!isFinance && menu.p.centreChangeState !== "Requested"
+                ? [{ label: "🏢 Request Centre Change", onClick: () => openAction("centre", menu.p) }]
+                : []),
+              { label: "⚠️ Likely Cancellation", onClick: () => openAction("likely", menu.p) },
               { label: "📞 Revert to Telecalling Team", onClick: () => openAction("revert", menu.p) },
               { label: "🛑 Direct cancellation request", onClick: () => openAction("cancel", menu.p) },
               ...(menu.p.requestState === "Cancellation Requested" && canApprove
                 ? [{ label: "✅ Review cancellation (Superadmin)", onClick: () => openAction("review", menu.p) }]
                 : []),
-              {
-                label: "📝 Follow-up",
-                onClick: () => {
-                  const target = menu.p;
-                  setMenu(null);
-                  openFollowUp(target);
-                },
-              },
             ].map((it) => (
               <button
                 key={it.label}
@@ -1029,10 +1284,16 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
             <div className="mb-1 text-sm font-semibold text-primary-dark">
               {action.kind === "status"
                 ? "Update Status"
+                : action.kind === "likely"
+                ? "Likely Cancellation (manual)"
                 : action.kind === "centre"
-                ? "Change Centre (Sales Reporting)"
+                ? isFinance
+                  ? "Change Centre (Sales Reporting)"
+                  : "Request Centre Change (Sales Reporting)"
+                : action.kind === "centre_review"
+                ? "Centre Change Request — Accounts approval"
                 : action.kind === "revert"
-                ? "Revert to Telecalling Team (Megha)"
+                ? "Revert to Telecalling Team"
                 : action.kind === "cancel"
                 ? "Direct Cancellation Request"
                 : "Cancellation Review (Superadmin)"}{" "}
@@ -1102,6 +1363,29 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
               </>
             )}
 
+            {action.kind === "likely" && (
+              <>
+                <label className="mb-1 block text-[11.5px] font-semibold text-text-mid">Reason</label>
+                <div className="mb-3 flex flex-wrap gap-1.5">
+                  {CANCEL_REASONS.map((r) => (
+                    <button
+                      key={r}
+                      type="button"
+                      onClick={() => setStReason(r)}
+                      className={`rounded-full border px-3 py-1 text-[11.5px] font-semibold transition-colors ${
+                        stReason === r ? "border-primary bg-primary-soft text-primary-dark" : "border-border text-text-mid hover:border-primary"
+                      }`}
+                    >
+                      {r}
+                    </button>
+                  ))}
+                </div>
+                <div className="mb-3 rounded-[8px] bg-surface-2 px-3 py-2 text-[11.5px] text-text-soft">
+                  The patient's status will show “Likely Cancellation” (set manually).
+                </div>
+              </>
+            )}
+
             {action.kind === "centre" && (
               <>
                 <div className="mb-3 grid grid-cols-2 gap-3">
@@ -1119,7 +1403,7 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
                       className="w-full rounded-[8px] border border-border bg-surface px-2.5 py-2 text-[12.5px] outline-none focus:border-primary"
                     >
                       <option value="">Select centre…</option>
-                      {Array.from(new Set([...centres, ...localPatients.map((x) => x.centre)]))
+                      {Array.from(new Set([...allCentres, ...centres, ...localPatients.map((x) => x.centre)]))
                         .filter((c) => c && c !== (action.p.salesCentre || action.p.centre))
                         .sort()
                         .map((c) => (
@@ -1137,50 +1421,68 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
                   placeholder="Why is the sales reporting centre being switched?"
                   className="mb-3 w-full rounded-[8px] border border-border bg-surface px-3 py-2 text-[12.5px] outline-none focus:border-primary"
                 />
+                {!isFinance && (
+                  <div className="mb-3 rounded-[8px] bg-surface-2 px-3 py-2 text-[11.5px] text-text-soft">
+                    This is a request — the centre changes only after the Accounts team approves it.
+                  </div>
+                )}
               </>
             )}
 
-            {action.kind === "revert" && (
+            {action.kind === "centre_review" && (
               <>
-                <div className="mb-3 space-y-2">
+                <div className="mb-3 rounded-[8px] bg-surface-2 px-3 py-2 text-[12px] leading-relaxed text-text-mid">
+                  <div>
+                    <b>{action.p.salesCentre || action.p.centre || "—"}</b> → <b>{action.p.centreChangeTo || "—"}</b>
+                  </div>
+                  <div>Reason: {action.p.centreChangeReason || "—"}</div>
+                  {action.p.centreChangeBy && <div>Requested by: {action.p.centreChangeBy}</div>}
+                </div>
+                <div className="mb-3 grid grid-cols-2 gap-2">
                   {(
                     [
-                      ["revert", "Revert to Telecalling Team (Megha)"],
-                      ["reactive", "ReActive — return to branch"],
-                      ["cancellation_request", "Cancellation request"],
+                      ["approved", "✅ Approve"],
+                      ["rejected", "✖ Reject"],
                     ] as const
                   ).map(([val, label]) => (
                     <label
                       key={val}
-                      className={`flex cursor-pointer items-center gap-2.5 rounded-lg border px-3 py-2 text-[12.5px] font-semibold ${
-                        revMode === val ? "border-primary bg-primary-soft text-primary-dark" : "border-border text-text-mid"
+                      className={`flex cursor-pointer items-center justify-center gap-2 rounded-lg border px-3 py-2 text-[12.5px] font-semibold ${
+                        ccDecision === val ? "border-primary bg-primary-soft text-primary-dark" : "border-border text-text-mid"
                       }`}
                     >
-                      <input type="radio" name="rev-mode" checked={revMode === val} onChange={() => { setRevMode(val); setStReason(""); }} />
+                      <input type="radio" name="cc-decision" checked={ccDecision === val} onChange={() => setCcDecision(val)} />
                       {label}
                     </label>
                   ))}
                 </div>
-                {revMode === "cancellation_request" && (
-                  <>
-                    <label className="mb-1 block text-[11.5px] font-semibold text-text-mid">Cancellation reason</label>
-                    <div className="mb-3 flex flex-wrap gap-1.5">
-                      {CANCEL_REASONS.map((r) => (
-                        <button
-                          key={r}
-                          type="button"
-                          onClick={() => setStReason(r)}
-                          className={`rounded-full border px-3 py-1 text-[11.5px] font-semibold transition-colors ${
-                            stReason === r ? "border-primary bg-primary-soft text-primary-dark" : "border-border text-text-mid hover:border-primary"
-                          }`}
-                        >
-                          {r}
-                        </button>
-                      ))}
-                    </div>
-                  </>
+                {ccDecision === "approved" && (
+                  <div className="mb-3">
+                    <label className="mb-1 block text-[11.5px] font-semibold text-text-mid">Change to centre</label>
+                    <select
+                      value={ccCentre}
+                      onChange={(e) => setCcCentre(e.target.value)}
+                      className="w-full rounded-[8px] border border-border bg-surface px-2.5 py-2 text-[12.5px] outline-none focus:border-primary"
+                    >
+                      {Array.from(new Set([action.p.centreChangeTo || "", ...allCentres, ...centres, ...localPatients.map((x) => x.centre)]))
+                        .filter((c) => c && c !== (action.p.salesCentre || action.p.centre))
+                        .sort()
+                        .map((c) => (
+                          <option key={c} value={c}>
+                            {c}
+                          </option>
+                        ))}
+                    </select>
+                    <div className="mt-1 text-[10.5px] text-text-soft">The requested centre is pre-selected — pick another one if needed.</div>
+                  </div>
                 )}
               </>
+            )}
+
+            {action.kind === "revert" && (
+              <div className="mb-3 rounded-[8px] bg-surface-2 px-3 py-2 text-[12px] leading-relaxed text-text-mid">
+                This patient will be sent back to the Telecalling Team. The mail to the Telecalling Team has two buttons — Return to branch and Cancellation request. Add a remark below if needed.
+              </div>
             )}
 
             {action.kind === "cancel" && (
@@ -1200,9 +1502,21 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
                     </button>
                   ))}
                 </div>
-                <div className="mb-3 rounded-[8px] bg-surface-2 px-3 py-2 text-[11.5px] text-text-soft">
-                  This goes to the Superadmin for approval.
+                <div className="mb-3 rounded-[8px] bg-surface-2 px-3 py-2 text-[11.5px] leading-relaxed text-text-soft">
+                  This goes to the Administrator for approval — the mail has <b>Approve / Disapprove</b> buttons. The Accountant is in cc, and you get a
+                  confirmation mail now and another one when it is approved or disapproved.
                 </div>
+                {!sessionEmail() && (
+                  <div className="mb-3 rounded-[8px] bg-amber-100 px-3 py-2 text-[11.5px] text-amber-800">
+                    Your login has no email address, so you will not receive the confirmation mails.
+                  </div>
+                )}
+                <RecipientEditor
+                  title="Accountant (cc on request / approved / disapproved)"
+                  list={recipients.accountant}
+                  onChange={(email, op) => changeRecipient("accountant", email, op)}
+                  canRemove={canChangeDirect}
+                />
               </>
             )}
 
@@ -1228,6 +1542,9 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
                       {label}
                     </label>
                   ))}
+                </div>
+                <div className="mb-3 rounded-[8px] bg-surface-2 px-3 py-2 text-[11.5px] text-text-soft">
+                  The person who raised the request gets a mail, with the Accountant in cc.
                 </div>
                 {reviewDecision === "approved" ? (
                   <>
@@ -1267,6 +1584,7 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
                 title={popupMailKind() === "admin" ? "Mail goes to Admin" : "Mail goes to Telecalling Team"}
                 list={recipients[popupMailKind() as "admin" | "telecalling"]}
                 onChange={(email, op) => changeRecipient(popupMailKind() as "admin" | "telecalling", email, op)}
+                canRemove={canChangeDirect}
               />
             )}
 
@@ -1310,7 +1628,7 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
           <div className="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-[14px] bg-surface p-5 shadow-xl" onClick={(e) => e.stopPropagation()}>
             <div className="mb-1 text-sm font-semibold text-primary-dark">✉ Notification emails</div>
             <div className="mb-4 text-[11.5px] leading-relaxed text-text-soft">
-              Admin gets cancellation requests and decisions. The Telecalling Team gets “Revert to Telecalling” and “Forwarded to Megha” mails.
+              Admin gets the cancellation approval mails. The Telecalling Team gets the “Revert to Telecalling” mails. The Accountant is cc’d on every cancellation request and decision.
             </div>
             {mailMode === "console" && (
               <div className="mb-3 rounded-[8px] bg-amber-100 px-3 py-2 text-[11.5px] leading-relaxed text-amber-800">
@@ -1379,6 +1697,13 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
                     <input type="checkbox" checked={smtp.useTls} onChange={(e) => setSmtp({ ...smtp, useTls: e.target.checked })} />
                     Use TLS (recommended — port 587)
                   </label>
+                  <label className="col-span-3 flex items-start gap-2 text-[11.5px] text-text-soft">
+                    <input type="checkbox" className="mt-0.5" checked={!smtp.verifySsl} onChange={(e) => setSmtp({ ...smtp, verifySsl: !e.target.checked })} />
+                    <span>
+                      Skip SSL certificate check — only tick this if mails fail with “CERTIFICATE_VERIFY_FAILED” (e.g. an office network that
+                      intercepts HTTPS). The mail is still encrypted.
+                    </span>
+                  </label>
                 </div>
                 <div className="mt-1.5 text-[10.5px] leading-relaxed text-text-soft">
                   Gmail: use an App Password (Google Account → Security → 2-Step Verification → App passwords), not your normal password.
@@ -1410,8 +1735,9 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
                 </div>
               </div>
             )}
-            <RecipientEditor title="Admin" list={recipients.admin} onChange={(e, op) => changeRecipient("admin", e, op)} />
-            <RecipientEditor title="Telecalling Team" list={recipients.telecalling} onChange={(e, op) => changeRecipient("telecalling", e, op)} />
+            <RecipientEditor title="Admin" list={recipients.admin} onChange={(e, op) => changeRecipient("admin", e, op)} canRemove={canChangeDirect} />
+            <RecipientEditor title="Telecalling Team" list={recipients.telecalling} onChange={(e, op) => changeRecipient("telecalling", e, op)} canRemove={canChangeDirect} />
+            <RecipientEditor title="Accountant (cc on cancellation request / decision)" list={recipients.accountant} onChange={(e, op) => changeRecipient("accountant", e, op)} canRemove={canChangeDirect} />
             <label className="mb-2 block text-[11px] text-text-soft">
               Test mail to (optional — blank = the saved list)
               <input
