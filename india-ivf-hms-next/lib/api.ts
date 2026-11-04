@@ -10,12 +10,18 @@ import type {
   TriggerItem,
 } from "./types";
 
-/** Server Components can't fetch relative URLs — resolve the current request's origin. */
+/**
+ * Server Components can't fetch relative URLs, so resolve an absolute origin for the /api call.
+ * On localhost: the request's own origin. Behind the public domain: this same Next.js server on
+ * 127.0.0.1 — going out through the public URL can bounce http -> https, and that redirect drops
+ * the login cookie, so every /api call came back 401.
+ */
 async function baseUrl(): Promise<string> {
+  if (process.env.INTERNAL_API_ORIGIN) return process.env.INTERNAL_API_ORIGIN.replace(/\/$/, "");
   const h = await headers();
   const host = h.get("host") ?? "localhost:3000";
-  const proto = h.get("x-forwarded-proto") ?? (host.startsWith("localhost") ? "http" : "https");
-  return `${proto}://${host}`;
+  if (/^(localhost|127\.0\.0\.1)(:|$)/.test(host)) return `http://${host}`;
+  return `http://127.0.0.1:${process.env.PORT || 3000}`;
 }
 
 async function getJSON<T>(path: string): Promise<T> {
