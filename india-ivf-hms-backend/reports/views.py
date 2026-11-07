@@ -16,45 +16,86 @@ DATA_START_DATE = '2024-04-01'
 
 # ---- "D/S" lead source: a patient with ANY hms_appointments row whose lead_source is 'D/S'
 # must not show up anywhere in this app (lists, counts, journey, aging, dashboard). ----
+import re as _re_ds
+import time as _time_ds
+
+_DS_CACHE = {'at': 0.0, 'ids': []}
+_DS_TTL_SECONDS = 120
+
+
+def ds_patient_ids():
+    """Patient IDs that have ANY hms_appointments row with lead_source 'D/S'.
+    Looked up once (cached ~2 min per worker) so every list query only needs a plain
+    `NOT IN (<ids>)` - a per-query subquery was far too slow on the live database."""
+    now = _time_ds.time()
+    if now - _DS_CACHE['at'] < _DS_TTL_SECONDS:
+        return _DS_CACHE['ids']
+    ids = _DS_CACHE['ids']
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT DISTINCT TRIM(paitent_id) FROM hms_appointments "
+                "WHERE lead_source = 'D/S' AND paitent_id IS NOT NULL AND paitent_id <> ''"
+            )
+            ids = sorted({str(r[0]) for r in cursor.fetchall()
+                          if r[0] and _re_ds.fullmatch(r'[A-Za-z0-9_-]+', str(r[0]))})
+    except Exception:
+        pass  # keep the previous list (or none) rather than breaking every page
+    _DS_CACHE['at'] = now
+    _DS_CACHE['ids'] = ids
+    return ids
+
+
+def _ds_list_sql():
+    return ", ".join("'" + i + "'" for i in ds_patient_ids())
+
+
 def ds_in(col):
     """SQL condition: <col> (a patient id) belongs to a D/S patient."""
-    return (
-        f"CONVERT({col} USING utf8mb4) COLLATE utf8mb4_general_ci IN ("
-        "SELECT CONVERT(TRIM(ds.paitent_id) USING utf8mb4) COLLATE utf8mb4_general_ci "
-        "FROM hms_appointments ds "
-        "WHERE TRIM(ds.lead_source) = 'D/S' AND ds.paitent_id IS NOT NULL AND TRIM(ds.paitent_id) <> '')"
-    )
+    lst = _ds_list_sql()
+    return f"{col} IN ({lst})" if lst else "1 = 0"
 
 
 def ds_not(col):
     """SQL fragment 'AND (<col> is not a D/S patient)' - col holds a patient id."""
-    return f"AND ({col} IS NULL OR TRIM({col}) = '' OR NOT ({ds_in(col)}))"
+    lst = _ds_list_sql()
+    if not lst:
+        return ""
+    return f"AND ({col} IS NULL OR {col} NOT IN ({lst}))"
+
 
 # the appointment row itself is D/S (covers appointments that have no patient id yet)
-DS_A_ROW = "AND TRIM(IFNULL(a.lead_source, '')) <> 'D/S'"
-DS_A = DS_A_ROW + " " + ds_not("a.paitent_id")      # appointment-based queries (alias a)
-DS_P = ds_not("p.patient_id")                        # hms_patient_procedure (alias p)
-DS_J = ds_not("j.patient_id")                        # hms_patient_journey (alias j)
-DS_HC = ds_not("hc.patient_id")                      # hms_consultation (alias hc)
+DS_A_ROW = "AND IFNULL(a.lead_source, '') <> 'D/S'"
+
+
+def ds_a():
+    return DS_A_ROW + " " + ds_not("a.paitent_id")   # appointment-based queries (alias a)
+
+
+def ds_p():
+    return ds_not("p.patient_id")                    # hms_patient_procedure (alias p)
+
+
+def ds_j():
+    return ds_not("j.patient_id")                    # hms_patient_journey (alias j)
+
+
+def ds_hc():
+    return ds_not("hc.patient_id")                   # hms_consultation (alias hc)
 
 
 def is_ds_patient_token(token):
     """True when token (a patient id OR a receipt number) belongs to a D/S patient."""
+    ids = set(ds_patient_ids())
+    if not ids:
+        return False
+    token = str(token).strip()
+    if token in ids:
+        return True
     with connection.cursor() as cursor:
-        cursor.execute("""
-            SELECT 1 FROM hms_appointments ds
-            WHERE TRIM(ds.lead_source) = 'D/S' AND ds.paitent_id IS NOT NULL AND TRIM(ds.paitent_id) <> ''
-              AND (
-                    CONVERT(TRIM(ds.paitent_id) USING utf8mb4) COLLATE utf8mb4_general_ci = CONVERT(%s USING utf8mb4) COLLATE utf8mb4_general_ci
-                 OR CONVERT(TRIM(ds.paitent_id) USING utf8mb4) COLLATE utf8mb4_general_ci IN (
-                        SELECT CONVERT(TRIM(pp.patient_id) USING utf8mb4) COLLATE utf8mb4_general_ci
-                        FROM hms_patient_procedure pp
-                        WHERE CONVERT(pp.receipt_number USING utf8mb4) COLLATE utf8mb4_general_ci = CONVERT(%s USING utf8mb4) COLLATE utf8mb4_general_ci)
-              )
-            LIMIT 1
-        """, [str(token), str(token)])
-        return cursor.fetchone() is not None
-
+        cursor.execute("SELECT patient_id FROM hms_patient_procedure WHERE receipt_number = %s LIMIT 1", [token])
+        row = cursor.fetchone()
+    return bool(row and str(row[0]).strip() in ids)
 
 
 # ============================================================
@@ -342,7 +383,7 @@ def get_cnb_data(request):
         WHERE a.paitent_type = 'new_patient' 
           AND a.status = 'consultation_done'
           AND p.appointment_id IS NULL
-          """ + DS_A + """
+          """ + ds_a() + """
     """
     with connection.cursor() as cursor:
         cursor.execute(query)
@@ -426,7 +467,7 @@ def get_procedure_billing_data(request):
         WHERE a.paitent_type = 'new_patient' 
           AND a.status = 'consultation_done'
           AND p.status IN ('pending', 'approved')
-          """ + DS_A + """
+          """ + ds_a() + """
         GROUP BY COALESCE(NULLIF(TRIM(a.paitent_id), ''), CAST(a.id AS CHAR))
         ORDER BY MIN(a.appoitmented_date) DESC;
     """
@@ -479,7 +520,7 @@ def get_dynamic_booked_patients(request):
           AND a.status = 'consultation_done'
           AND p.status IN ('pending', 'approved')
           AND a.appoitmented_date >= '{DATA_START_DATE}'
-          {DS_A}
+          {ds_a()}
           {centre_filter_sql}
         GROUP BY COALESCE(NULLIF(TRIM(a.paitent_id), ''), CAST(a.id AS CHAR))
         ORDER BY MIN(a.appoitmented_date) DESC;
@@ -882,7 +923,7 @@ def get_centre_comparison(request):
                 ON p.billing_at = c.center_number
                 AND (p.status IS NULL OR p.status NOT IN ('cancelled', 'disapproved'))
                 AND DATE(p.on_date) BETWEEN %s AND %s
-                """ + DS_P + """
+                """ + ds_p() + """
             LEFT JOIN (
                 SELECT billing_id, SUM(payment_done) AS total_paid
                 FROM hms_patient_payments
@@ -912,7 +953,7 @@ def get_centre_comparison(request):
             LEFT JOIN hms_patient_procedure p
                 ON p.billing_at = c.center_number
                 AND (p.status IS NULL OR p.status NOT IN ('cancelled', 'disapproved'))
-                {DS_P}
+                {ds_p()}
             {centre_filter_sql}
             GROUP BY c.center_number, c.center_name
             ORDER BY c.center_name ASC;
@@ -2001,7 +2042,7 @@ def get_aging_snapshot(request):
             AND p.remaining_amount > 0
             AND p.on_date >= '{DATA_START_DATE}'
             AND (p.status IS NULL OR p.status NOT IN ('cancelled', 'disapproved'))
-            {DS_P}
+            {ds_p()}
         {by_centre_filter_sql}
         GROUP BY c.center_number, c.center_name
         ORDER BY c.center_name ASC;
@@ -2037,7 +2078,7 @@ def get_aging_snapshot(request):
         WHERE p.remaining_amount > 0
           AND p.on_date >= '{DATA_START_DATE}'
           AND (p.status IS NULL OR p.status NOT IN ('cancelled', 'disapproved'))
-          {DS_P}
+          {ds_p()}
           {DS_A_ROW}
           {patients_filter_sql}
         ORDER BY p.on_date DESC;
@@ -2316,7 +2357,7 @@ def get_prebook_data(request):
         LEFT JOIN hms_centers c ON a.center = c.center_number
         WHERE a.status = 'booked'
           AND a.appoitmented_date >= '{DATA_START_DATE}'
-          {DS_A}
+          {ds_a()}
           {appt_centre_filter_sql}
         ORDER BY a.appoitmented_date DESC;
     """
@@ -2331,7 +2372,7 @@ def get_prebook_data(request):
         LEFT JOIN hms_centers c ON a.center = c.center_number
         WHERE a.status = 'no_show'
           AND a.appoitmented_date >= '{DATA_START_DATE}'
-          {DS_A}
+          {ds_a()}
           {appt_centre_filter_sql}
         ORDER BY a.appoitmented_date DESC;
     """
@@ -2374,8 +2415,8 @@ def get_prebook_data(request):
                 )
               )
           AND hc.on_date >= '{DATA_START_DATE}'
-          {DS_A}
-          {DS_HC}
+          {ds_a()}
+          {ds_hc()}
           {cnb_centre_filter_sql}
         ORDER BY hc.on_date DESC;
     """
@@ -2508,7 +2549,7 @@ def get_red_triggers(request):
         LEFT JOIN hms_centers c ON j.centre_booking REGEXP '^[0-9]+$' AND c.center_number = CAST(j.centre_booking AS UNSIGNED)
         WHERE j.balance_amount > 0
           AND j.booking_date IS NOT NULL
-          {DS_J}
+          {ds_j()}
           {centre_filter_sql}
         ORDER BY j.balance_amount DESC;
     """
@@ -2618,7 +2659,7 @@ def get_stage_patients(request):
         FROM hms_patient_journey j
         LEFT JOIN hms_centers c ON j.centre_booking REGEXP '^[0-9]+$' AND c.center_number = CAST(j.centre_booking AS UNSIGNED)
         WHERE j.booking_date IS NOT NULL
-          {DS_J}
+          {ds_j()}
           {journey_filter_sql}
         ORDER BY j.booking_date DESC;
     """
@@ -2693,7 +2734,7 @@ def get_dashboard_summary(request):
                 COALESCE(SUM(CASE WHEN MONTH(p.on_date) = MONTH(CURDATE()) AND YEAR(p.on_date) = YEAR(CURDATE()) THEN p.totalpackage ELSE 0 END), 0) AS exp_month
             FROM hms_patient_procedure p
             WHERE (p.status IS NULL OR p.status NOT IN ('cancelled', 'disapproved'))
-              {DS_P}
+              {ds_p()}
               {billing_filter_sql}
         """
         with connection.cursor() as cursor:
@@ -2708,7 +2749,7 @@ def get_dashboard_summary(request):
             FROM hms_patient_payments pay
             INNER JOIN hms_patient_procedure p ON p.receipt_number = pay.billing_id
             WHERE pay.status IN ('0', '1')
-              {DS_P}
+              {ds_p()}
               {billing_filter_sql}
         """
         with connection.cursor() as cursor:
@@ -2721,7 +2762,7 @@ def get_dashboard_summary(request):
             INNER JOIN hms_patient_procedure p ON p.receipt_number = pay.billing_id
             WHERE pay.status IN ('0', '1')
               AND pay.on_date >= DATE_SUB(CURDATE(), INTERVAL 6 DAY)
-              {DS_P}
+              {ds_p()}
               {billing_filter_sql}
             GROUP BY DATE(pay.on_date)
             ORDER BY d ASC
@@ -2746,10 +2787,13 @@ def get_dashboard_summary(request):
 
         ensure_aging_followup_table()
         with connection.cursor() as cursor:
+            _ds_lst = _ds_list_sql()
+            _ds_clause = (
+                "AND f.invoice NOT IN (SELECT p.receipt_number FROM hms_patient_procedure p "
+                "WHERE p.receipt_number IS NOT NULL AND p.patient_id IN (" + _ds_lst + "))"
+            ) if _ds_lst else ""
             cursor.execute(
-                "SELECT COUNT(*) FROM reports_agingfollowup f WHERE f.status = %s "
-                "AND f.invoice NOT IN (SELECT p.receipt_number FROM hms_patient_procedure p WHERE p.receipt_number IS NOT NULL "
-                "AND " + ds_in("p.patient_id") + ")",
+                "SELECT COUNT(*) FROM reports_agingfollowup f WHERE f.status = %s " + _ds_clause,
                 ['Cancellation Request'])
             approvals_pending = cursor.fetchone()[0]
 
@@ -2760,7 +2804,7 @@ def get_dashboard_summary(request):
             FROM hms_patient_journey j
             LEFT JOIN hms_centers c ON j.centre_booking REGEXP '^[0-9]+$' AND c.center_number = CAST(j.centre_booking AS UNSIGNED)
             WHERE j.booking_date IS NOT NULL
-              {DS_J}
+              {ds_j()}
               {journey_filter_sql}
         """
         with connection.cursor() as cursor:
