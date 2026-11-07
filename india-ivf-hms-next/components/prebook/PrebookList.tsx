@@ -9,10 +9,16 @@ import { getClientSession, isReadOnlyRole } from "@/lib/clientSession";
 
 const LABELS: Record<PrebookType, string> = { scheduled: "Appointments Scheduled", missed: "Missed Appointments", cnb: "Consulted Not Booked" };
 const DATE_LABELS: Record<PrebookType, string> = { scheduled: "Date of Appointment", missed: "Date of Missed Appointment", cnb: "Date of Consult" };
-const RANGE_LABELS: Record<string, string> = { today: "today", week: "this week", month: "this month", all: "all time" };
+const RANGE_LABELS: Record<string, string> = { today: "today", week: "this week", month: "this month", all: "all time", custom: "custom dates" };
 
-function inRange(iso: string, range: string): boolean {
+function inRange(iso: string, range: string, from = "", to = ""): boolean {
   if (range === "all") return true;
+  if (range === "custom") {
+    const day = (iso || "").slice(0, 10);
+    if (from && day < from) return false;
+    if (to && day > to) return false;
+    return true;
+  }
   const T = new Date(TODAY + "T00:00:00");
   const d = new Date(iso + "T00:00:00");
   if (range === "today") return d.getTime() === T.getTime();
@@ -43,16 +49,68 @@ type SaveState = "saving" | "saved" | "error";
 
 export default function PrebookList({ type, prebook }: { type: PrebookType; prebook: PrebookPatient[] }) {
   const [range, setRange] = useState("today");
+  const [fromDate, setFromDate] = useState("");
+  const [toDate, setToDate] = useState("");
+  const [doctorFilter, setDoctorFilter] = useState("all");
+  const [treatmentFilter, setTreatmentFilter] = useState("all");
+  const [qualityFilter, setQualityFilter] = useState("all");
+  const [search, setSearch] = useState("");
   const [edits, setEdits] = useState<Record<string, CnbEdit>>({});
   const [saveState, setSaveState] = useState<Partial<Record<string, SaveState>>>({});
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(50);
 
-  const list = useMemo(() => prebook.filter((p) => p.type === type && inRange(p.date, range)), [prebook, type, range]);
+  // Filter choices come from this page's own patients (Consulted Not Booked only).
+  const typeRows = useMemo(() => prebook.filter((p) => p.type === type), [prebook, type]);
+  const doctorOptions = useMemo(
+    () => Array.from(new Set<string>(typeRows.map((p) => (p.doctor || "").trim()).filter(Boolean))).sort((a: string, b: string) => a.localeCompare(b)),
+    [typeRows]
+  );
+  const treatmentOptions = useMemo(
+    () =>
+      Array.from(new Set<string>(typeRows.flatMap((p) => p.treatments || []).map((t: string) => t.trim()).filter(Boolean))).sort(
+        (a: string, b: string) => a.localeCompare(b)
+      ),
+    [typeRows]
+  );
+
+  const list = useMemo(
+    () =>
+      typeRows.filter((p) => {
+        // Search by patient (IIC) ID or name
+        const q = search.trim().toLowerCase();
+        if (q && !String(p.id || "").toLowerCase().includes(q) && !String(p.name || "").toLowerCase().includes(q)) return false;
+        // While searching, the date range is ignored so an ID is found whatever its consult date.
+        if (!q && !inRange(p.date, range, fromDate, toDate)) return false;
+        if (type === "cnb") {
+          // saved quality (a row with nothing saved yet counts as "Cold", same as the dropdown shows)
+          if (qualityFilter !== "all" && (p.quality || "Cold") !== qualityFilter) return false;
+          if (doctorFilter !== "all" && (p.doctor || "").trim() !== doctorFilter) return false;
+          if (treatmentFilter !== "all") {
+            if (treatmentFilter === "__none__") {
+              if ((p.treatments || []).length > 0) return false;
+            } else if (!(p.treatments || []).includes(treatmentFilter)) return false;
+          }
+        }
+        return true;
+      }),
+    [typeRows, type, search, range, fromDate, toDate, doctorFilter, treatmentFilter, qualityFilter]
+  );
+
+  const filtersActive = search.trim() !== "" || range !== "today" || doctorFilter !== "all" || treatmentFilter !== "all" || qualityFilter !== "all";
+  function clearFilters() {
+    setRange("today");
+    setFromDate("");
+    setToDate("");
+    setDoctorFilter("all");
+    setTreatmentFilter("all");
+    setQualityFilter("all");
+    setSearch("");
+  }
 
   useEffect(() => {
     setPage(1);
-  }, [type, range, pageSize]);
+  }, [type, search, range, fromDate, toDate, doctorFilter, treatmentFilter, qualityFilter, pageSize]);
 
   const totalPages = Math.max(1, Math.ceil(list.length / pageSize));
   const safePage = Math.min(page, totalPages);
@@ -104,15 +162,99 @@ export default function PrebookList({ type, prebook }: { type: PrebookType; preb
     <section className="screen-enter">
       <PageHead
         title={LABELS[type]}
-        sub={`${list.length} patient${list.length !== 1 ? "s" : ""} · ${RANGE_LABELS[range]} · click an IIC ID to open the patient journey`}
+        sub={`${list.length} patient${list.length !== 1 ? "s" : ""} · ${
+          range === "custom" ? (fromDate || toDate ? `${fromDate || "…"} to ${toDate || "…"}` : "custom dates") : RANGE_LABELS[range]
+        } · click an IIC ID to open the patient journey`}
         actions={
           <>
+            <input
+              type="search"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search patient ID / name"
+              className="w-[190px] rounded-[9px] border border-border bg-surface px-3 py-1.5 text-[11.5px]"
+            />
             <select value={range} onChange={(e) => setRange(e.target.value)} className="rounded-[9px] border border-border bg-surface px-3 py-1.5 text-[11.5px]">
               <option value="today">Today</option>
               <option value="week">This week</option>
               <option value="month">This month</option>
               <option value="all">All time</option>
+              <option value="custom">Custom dates…</option>
             </select>
+            {range === "custom" && (
+              <>
+                <input
+                  type="date"
+                  value={fromDate}
+                  max={toDate || undefined}
+                  onChange={(e) => setFromDate(e.target.value)}
+                  title="From date"
+                  className="rounded-[9px] border border-border bg-surface px-2.5 py-1.5 text-[11.5px]"
+                />
+                <span className="text-[11px] text-text-soft">to</span>
+                <input
+                  type="date"
+                  value={toDate}
+                  min={fromDate || undefined}
+                  onChange={(e) => setToDate(e.target.value)}
+                  title="To date"
+                  className="rounded-[9px] border border-border bg-surface px-2.5 py-1.5 text-[11.5px]"
+                />
+              </>
+            )}
+            {type === "cnb" && (
+              <>
+                <select
+                  value={qualityFilter}
+                  onChange={(e) => setQualityFilter(e.target.value)}
+                  className="rounded-[9px] border border-border bg-surface px-3 py-1.5 text-[11.5px]"
+                  title="Filter by quality"
+                >
+                  <option value="all">All quality</option>
+                  {QUALITIES.map((q) => (
+                    <option key={q} value={q}>
+                      {q}
+                    </option>
+                  ))}
+                </select>
+                <select
+                  value={doctorFilter}
+                  onChange={(e) => setDoctorFilter(e.target.value)}
+                  className="max-w-[190px] rounded-[9px] border border-border bg-surface px-3 py-1.5 text-[11.5px]"
+                  title="Filter by doctor"
+                >
+                  <option value="all">All doctors</option>
+                  {doctorOptions.map((d) => (
+                    <option key={d} value={d}>
+                      {d}
+                    </option>
+                  ))}
+                </select>
+                <select
+                  value={treatmentFilter}
+                  onChange={(e) => setTreatmentFilter(e.target.value)}
+                  className="max-w-[260px] rounded-[9px] border border-border bg-surface px-3 py-1.5 text-[11.5px]"
+                  title="Filter by treatment advised"
+                >
+                  <option value="all">All treatments</option>
+                  <option value="__none__">No treatment advised</option>
+                  {treatmentOptions.map((t) => (
+                    <option key={t} value={t}>
+                      {t}
+                    </option>
+                  ))}
+                </select>
+              </>
+            )}
+            {filtersActive && (
+              <button
+                type="button"
+                onClick={clearFilters}
+                className="rounded-[9px] border border-border px-3 py-1.5 text-[11.5px] font-semibold text-text-mid hover:border-primary hover:text-primary"
+              >
+                Clear filters
+              </button>
+            )}
             <Link href="/dashboard" className="rounded-[9px] border border-border px-3 py-1.5 text-[11.5px] font-semibold text-text-mid hover:border-primary hover:text-primary">
               ← Back to dashboard
             </Link>

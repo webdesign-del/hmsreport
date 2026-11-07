@@ -63,7 +63,11 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
   const [stagesOpen, setStagesOpen] = useState(true); // whole "Clinical Journey Stages" card
 
   // 📅 DATE CHANGE INLINE POPOVER STATE
-  const [editingStageIdx, setEditingStageIdx] = useState<number | null>(null);
+  const [editingDateKey, setEditingDateKey] = useState<string | null>(null);
+  // Saved "Change dates" entries (loaded from / saved to the database), keyed "<cycle>|<stage>".
+  const [dateChanges, setDateChanges] = useState<Record<string, { from: string; to: string; reason: string; by: string; at: string }>>({});
+  const [dateSaving, setDateSaving] = useState(false);
+  const [dateError, setDateError] = useState("");
   const [dateChangeForm, setDateChangeForm] = useState({
     fromDate: localISODate(),
     toDate: localISODate(),
@@ -132,6 +136,26 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
   const [delayRemarks, setDelayRemarks] = useState("");
   const [delaySaving, setDelaySaving] = useState(false);
   const [delayError, setDelayError] = useState("");
+
+  const loadDateChanges = async (patientId: string) => {
+    try {
+      const res = await fetch(`/api/stage-date-change?patient_id=${encodeURIComponent(patientId)}`, { cache: "no-store" });
+      const json = await res.json();
+      const map: Record<string, { from: string; to: string; reason: string; by: string; at: string }> = {};
+      (json.changes || []).forEach((c: any) => {
+        map[`${c.cycle_key}|${c.stage_key}`] = {
+          from: c.from_date || "",
+          to: c.to_date || "",
+          reason: c.reason || "",
+          by: c.changed_by || "",
+          at: c.updated_at || "",
+        };
+      });
+      setDateChanges(map);
+    } catch {
+      setDateChanges({});
+    }
+  };
 
   const loadStageDelays = async (patientId: string) => {
     try {
@@ -234,7 +258,10 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
 
       if (res.ok && json.status === "success") {
         setPatientProfile(json.data);
-        if (json.data?.patient_id) loadStageDelays(String(json.data.patient_id));
+        if (json.data?.patient_id) {
+          loadStageDelays(String(json.data.patient_id));
+          loadDateChanges(String(json.data.patient_id));
+        }
         // Completed stages (First Consult, Booked, …) always start visible for a freshly loaded patient.
         setCollapseDone(false);
         const fetchedProcs = json.procedures || [];
@@ -327,21 +354,66 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
     });
   };
 
-  const handleOpenDateChange = (idx: number) => {
-    setEditingStageIdx(idx);
+  const handleOpenDateChange = (key: string) => {
+    const saved = dateChanges[key];
     const today = localISODate();
-    setDateChangeForm({ fromDate: today, toDate: today, reason: "" });
+    setEditingDateKey(key);
+    setDateError("");
+    setDateChangeForm({ fromDate: saved?.from || today, toDate: saved?.to || today, reason: saved?.reason || "" });
   };
 
-  const handleSaveDateChange = (idx: number) => {
+  // Saves to the database (previously this only changed on-screen state, so a reload lost it).
+  const handleSaveDateChange = async (key: string) => {
     if (!dateChangeForm.reason.trim()) {
-      alert("Please enter reason for change!");
+      setDateError("Please enter reason for change!");
       return;
     }
-    const updatedStages = [...stages];
-    updatedStages[idx].day = `${dateChangeForm.fromDate} - ${dateChangeForm.toDate}`;
-    setStages(updatedStages);
-    setEditingStageIdx(null);
+    if (!dateChangeForm.fromDate || !dateChangeForm.toDate) {
+      setDateError("Please select both dates.");
+      return;
+    }
+    if (dateChangeForm.toDate < dateChangeForm.fromDate) {
+      setDateError("TO date cannot be before FROM date.");
+      return;
+    }
+    const sep = key.indexOf("|");
+    const cycleKey = key.slice(0, sep);
+    const stageKey = key.slice(sep + 1);
+    setDateSaving(true);
+    setDateError("");
+    try {
+      const res = await fetch("/api/stage-date-change", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          patient_id: patientProfile?.patient_id,
+          cycle_key: cycleKey,
+          stage_key: stageKey,
+          from_date: dateChangeForm.fromDate,
+          to_date: dateChangeForm.toDate,
+          reason: dateChangeForm.reason.trim(),
+          user: sessionIdentity().user,
+          role: userRole || "",
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.status !== "success") throw new Error(data.message || "Failed to save.");
+      setDateChanges((prev) => ({
+        ...prev,
+        [key]: {
+          from: dateChangeForm.fromDate,
+          to: dateChangeForm.toDate,
+          reason: dateChangeForm.reason.trim(),
+          by: sessionIdentity().user,
+          at: "",
+        },
+      }));
+      setEditingDateKey(null);
+    } catch (e: any) {
+      setDateError(e?.message || "Failed to save.");
+    } finally {
+      setDateSaving(false);
+    }
   };
 
   // Codes to hide from the "Booked Procedures & Services" table — IP218/IP219 are
@@ -1305,6 +1377,12 @@ return (
           {isDone ? `Ideal: ${fmtDMY(idealDateForRow)} · ` : ""}Booked +{idealOffset} days
         </div>
       )}
+      {!isDone && dateChanges[delayKey] && (
+        <div className="text-[10.5px] font-semibold text-purple-700">
+          🗓 Rescheduled: {fmtDMY(dateChanges[delayKey].from)}
+          {dateChanges[delayKey].to !== dateChanges[delayKey].from ? ` → ${fmtDMY(dateChanges[delayKey].to)}` : ""}
+        </div>
+      )}
     </div>
   </>
 );
@@ -1316,7 +1394,9 @@ return (
   <td className="p-3.5 relative">
 {stg.status?.toLowerCase() === "done" || stg.status?.toLowerCase() === "completed" ? (
   <span className="text-slate-400 text-xs italic">— Stage Completed</span>
-) : editingStageIdx === i ? (
+) : cycleProcedures.length === 0 ? (
+  <span className="text-slate-300 text-xs" title="Change dates is available only after an IVF with Bed package is booked">—</span>
+) : editingDateKey === delayKey ? (
   <div className="z-20 w-64 rounded-xl border border-slate-200 bg-white p-3 shadow-xl space-y-2 text-xs animate-in fade-in zoom-in duration-150">
     <div>
       <label className="block text-[10px] font-bold uppercase text-slate-400 mb-0.5">FROM</label>
@@ -1351,17 +1431,19 @@ return (
       />
     </div>
 
+    {dateError && <div className="text-[10.5px] font-semibold text-red-600">{dateError}</div>}
     <div className="flex gap-2 pt-1">
       <button
         type="button"
-        onClick={() => handleSaveDateChange(i)}
-        className="rounded-md bg-[#6b21a8] px-3 py-1 font-bold text-white text-[11px] hover:bg-purple-900 transition"
+        disabled={dateSaving}
+        onClick={() => handleSaveDateChange(delayKey)}
+        className="rounded-md bg-[#6b21a8] px-3 py-1 font-bold text-white text-[11px] hover:bg-purple-900 transition disabled:opacity-60"
       >
-        Save
+        {dateSaving ? "Saving…" : "Save"}
       </button>
       <button
         type="button"
-        onClick={() => setEditingStageIdx(null)}
+        onClick={() => setEditingDateKey(null)}
         className="rounded-md border border-slate-300 px-3 py-1 font-bold text-slate-600 text-[11px] hover:bg-slate-100 transition"
       >
         Cancel
@@ -1369,13 +1451,22 @@ return (
     </div>
   </div>
 ) : (
-  <button
-    type="button"
-    onClick={() => handleOpenDateChange(i)}
-    className="rounded border border-slate-300 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-700 hover:border-purple-600 transition shadow-sm cursor-pointer"
-  >
-    ✎ Change dates
-  </button>
+  <div className="space-y-1">
+    <button
+      type="button"
+      onClick={() => handleOpenDateChange(delayKey)}
+      className="rounded border border-slate-300 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-700 hover:border-purple-600 transition shadow-sm cursor-pointer"
+    >
+      ✎ Change dates
+    </button>
+    {dateChanges[delayKey] && (
+      <div className="text-[10.5px] font-semibold text-purple-700" title={dateChanges[delayKey].reason}>
+        Changed: {fmtDMY(dateChanges[delayKey].from)}
+        {dateChanges[delayKey].to !== dateChanges[delayKey].from ? ` → ${fmtDMY(dateChanges[delayKey].to)}` : ""}
+        <div className="font-normal text-text-soft">{dateChanges[delayKey].reason}</div>
+      </div>
+    )}
+  </div>
 )}
   </td>
 )}
@@ -1571,19 +1662,34 @@ return (
                         </td>
                       )}
 
-                      {/* 8. Financials */}
+                      {/* 8. Financials — real booked amount only. There is no per-stage
+                          price in the data, so we no longer invent an average split
+                          (total ÷ stages) or mark "Paid" just because a stage is done.
+                          The cycle's actual fees / received / pending show on the Booked row. */}
                       {!hideFinancials && !hiddenTracks.has("financial") && (
                         <td className="p-3.5 text-right">
-                          <div className="font-bold text-text">
-                            ₹ {(primaryProc.fees || totalGross / stages.length).toLocaleString("en-IN")}
-                          </div>
-                          <div
-                            className={`text-[10.5px] font-semibold ${
-                              stg.status === "done" ? "text-green-600" : "text-amber-600"
-                            }`}
-                          >
-                            {stg.status === "done" ? "Paid" : "Due"}
-                          </div>
+                          {stg.key === "Booked" && cycleProcedures.length > 0 ? (() => {
+                            const cFees = cycleProcedures.reduce((a: number, p: any) => a + (Number(p.fees) || 0), 0);
+                            const cPaid = cycleProcedures.reduce((a: number, p: any) => a + (Number(p.payment_done) || 0), 0);
+                            const cPending = cycleProcedures.reduce((a: number, p: any) => a + (Number(p.pending) || 0), 0);
+                            return (
+                              <>
+                                <div className="font-bold text-text">₹ {cFees.toLocaleString("en-IN")}</div>
+                                <div className="text-[10.5px] font-semibold text-green-600">
+                                  Received ₹ {cPaid.toLocaleString("en-IN")}
+                                </div>
+                                <div
+                                  className={`text-[10.5px] font-semibold ${
+                                    cPending > 0 ? "text-amber-600" : "text-green-600"
+                                  }`}
+                                >
+                                  {cPending > 0 ? `Due ₹ ${cPending.toLocaleString("en-IN")}` : "Fully paid"}
+                                </div>
+                              </>
+                            );
+                          })() : (
+                            <span className="text-slate-300">—</span>
+                          )}
                         </td>
                       )}
 

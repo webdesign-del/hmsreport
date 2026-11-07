@@ -14,6 +14,48 @@ from django.core.mail import send_mail
 # Dashboard lists only show records dated on/after this day (1 April 2024).
 DATA_START_DATE = '2024-04-01'
 
+# ---- "D/S" lead source: a patient with ANY hms_appointments row whose lead_source is 'D/S'
+# must not show up anywhere in this app (lists, counts, journey, aging, dashboard). ----
+def ds_in(col):
+    """SQL condition: <col> (a patient id) belongs to a D/S patient."""
+    return (
+        f"CONVERT({col} USING utf8mb4) COLLATE utf8mb4_general_ci IN ("
+        "SELECT CONVERT(TRIM(ds.paitent_id) USING utf8mb4) COLLATE utf8mb4_general_ci "
+        "FROM hms_appointments ds "
+        "WHERE TRIM(ds.lead_source) = 'D/S' AND ds.paitent_id IS NOT NULL AND TRIM(ds.paitent_id) <> '')"
+    )
+
+
+def ds_not(col):
+    """SQL fragment 'AND (<col> is not a D/S patient)' - col holds a patient id."""
+    return f"AND ({col} IS NULL OR TRIM({col}) = '' OR NOT ({ds_in(col)}))"
+
+# the appointment row itself is D/S (covers appointments that have no patient id yet)
+DS_A_ROW = "AND TRIM(IFNULL(a.lead_source, '')) <> 'D/S'"
+DS_A = DS_A_ROW + " " + ds_not("a.paitent_id")      # appointment-based queries (alias a)
+DS_P = ds_not("p.patient_id")                        # hms_patient_procedure (alias p)
+DS_J = ds_not("j.patient_id")                        # hms_patient_journey (alias j)
+DS_HC = ds_not("hc.patient_id")                      # hms_consultation (alias hc)
+
+
+def is_ds_patient_token(token):
+    """True when token (a patient id OR a receipt number) belongs to a D/S patient."""
+    with connection.cursor() as cursor:
+        cursor.execute("""
+            SELECT 1 FROM hms_appointments ds
+            WHERE TRIM(ds.lead_source) = 'D/S' AND ds.paitent_id IS NOT NULL AND TRIM(ds.paitent_id) <> ''
+              AND (
+                    CONVERT(TRIM(ds.paitent_id) USING utf8mb4) COLLATE utf8mb4_general_ci = CONVERT(%s USING utf8mb4) COLLATE utf8mb4_general_ci
+                 OR CONVERT(TRIM(ds.paitent_id) USING utf8mb4) COLLATE utf8mb4_general_ci IN (
+                        SELECT CONVERT(TRIM(pp.patient_id) USING utf8mb4) COLLATE utf8mb4_general_ci
+                        FROM hms_patient_procedure pp
+                        WHERE CONVERT(pp.receipt_number USING utf8mb4) COLLATE utf8mb4_general_ci = CONVERT(%s USING utf8mb4) COLLATE utf8mb4_general_ci)
+              )
+            LIMIT 1
+        """, [str(token), str(token)])
+        return cursor.fetchone() is not None
+
+
 
 # ============================================================
 # 1. LEGACY HMS_DOCTORS DIRECT AUTHENTICATION & SESSIONS
@@ -300,6 +342,7 @@ def get_cnb_data(request):
         WHERE a.paitent_type = 'new_patient' 
           AND a.status = 'consultation_done'
           AND p.appointment_id IS NULL
+          """ + DS_A + """
     """
     with connection.cursor() as cursor:
         cursor.execute(query)
@@ -383,6 +426,7 @@ def get_procedure_billing_data(request):
         WHERE a.paitent_type = 'new_patient' 
           AND a.status = 'consultation_done'
           AND p.status IN ('pending', 'approved')
+          """ + DS_A + """
         GROUP BY COALESCE(NULLIF(TRIM(a.paitent_id), ''), CAST(a.id AS CHAR))
         ORDER BY MIN(a.appoitmented_date) DESC;
     """
@@ -435,6 +479,7 @@ def get_dynamic_booked_patients(request):
           AND a.status = 'consultation_done'
           AND p.status IN ('pending', 'approved')
           AND a.appoitmented_date >= '{DATA_START_DATE}'
+          {DS_A}
           {centre_filter_sql}
         GROUP BY COALESCE(NULLIF(TRIM(a.paitent_id), ''), CAST(a.id AS CHAR))
         ORDER BY MIN(a.appoitmented_date) DESC;
@@ -484,6 +529,13 @@ def get_patient_profile_detail(request):
     incoming_token = request.GET.get('receipt_number')
     if not incoming_token:
         return JsonResponse({'status': 'error', 'message': 'Receipt token parameter missing.'}, status=400)
+
+    # D/S lead-source patients are never shown in this app.
+    try:
+        if is_ds_patient_token(incoming_token):
+            return JsonResponse({'status': 'error', 'message': 'No patient profile match found in live database.'}, status=404)
+    except Exception:
+        pass
 
     # 1. Demographics
     demographics_query = """
@@ -830,6 +882,7 @@ def get_centre_comparison(request):
                 ON p.billing_at = c.center_number
                 AND (p.status IS NULL OR p.status NOT IN ('cancelled', 'disapproved'))
                 AND DATE(p.on_date) BETWEEN %s AND %s
+                """ + DS_P + """
             LEFT JOIN (
                 SELECT billing_id, SUM(payment_done) AS total_paid
                 FROM hms_patient_payments
@@ -859,6 +912,7 @@ def get_centre_comparison(request):
             LEFT JOIN hms_patient_procedure p
                 ON p.billing_at = c.center_number
                 AND (p.status IS NULL OR p.status NOT IN ('cancelled', 'disapproved'))
+                {DS_P}
             {centre_filter_sql}
             GROUP BY c.center_number, c.center_name
             ORDER BY c.center_name ASC;
@@ -956,8 +1010,17 @@ def save_aging_followup(request):
         # A plain follow-up note never changes the status or the "referred to tele" date.
         referred_date = None if followup_only else (current_now.date() if new_status == 'Revert to Telecaller team' else None)
         log_user = str(data.get('user') or '').strip()
+        # The follow-up popup may also flip the case between Active and On Hold.
+        set_status = bool(followup_only and data.get('set_status') and new_status in ('Active', 'On Hold'))
+        status_changed_note = ''
+        if set_status:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT status FROM reports_agingfollowup WHERE invoice = %s", [invoice])
+                prev = cursor.fetchone()
+            if not prev or (prev[0] or '') != new_status:
+                status_changed_note = f" — Status: {new_status}"
         if followup_only:
-            log_line = _fmt_log(log_user, f"Follow-up: {remarks} — Next follow-up: {next_date.strftime('%d-%b-%y')}")
+            log_line = _fmt_log(log_user, f"Follow-up: {remarks} — Next follow-up: {next_date.strftime('%d-%b-%y')}{status_changed_note}")
         else:
             log_line = _fmt_log(log_user, f"{new_status}: {remarks}" if remarks else new_status)
 
@@ -969,7 +1032,13 @@ def save_aging_followup(request):
                 existing_id, existing_history, existing_referred = row
                 new_history = f"{existing_history}\n{log_line}" if existing_history else log_line
                 final_referred = referred_date or existing_referred
-                if followup_only:
+                if followup_only and set_status:
+                    cursor.execute("""
+                        UPDATE reports_agingfollowup
+                        SET status = %s, remarks = %s, history_log = %s, updated_at = %s
+                        WHERE id = %s
+                    """, [new_status, remarks, new_history, current_now, existing_id])
+                elif followup_only:
                     cursor.execute("""
                         UPDATE reports_agingfollowup
                         SET remarks = %s, history_log = %s, updated_at = %s
@@ -993,7 +1062,8 @@ def save_aging_followup(request):
                                [next_date, invoice])
         _push_notif(invoice, patient_id, log_line)
         return JsonResponse({'status': 'success', 'message': 'Follow-up saved.', 'logLine': log_line,
-                             'nextFu': next_date.isoformat() if next_date else ''})
+                             'nextFu': next_date.isoformat() if next_date else '',
+                             'followStatus': new_status if set_status else ''})
     except Exception as e:
         return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
 
@@ -1122,6 +1192,85 @@ def get_stage_delays(request):
                 for r in cursor.fetchall()
             ]
         return JsonResponse({'status': 'success', 'delays': delays})
+    except Exception as e:
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+
+
+# ---- Journey stage date changes ("Change dates" in the Change-in-Plan column) ----
+def ensure_stage_date_change_table():
+    with connection.cursor() as cursor:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS reports_stagedatechange (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                patient_id VARCHAR(50) NOT NULL,
+                cycle_key VARCHAR(255) NOT NULL DEFAULT '',
+                stage_key VARCHAR(100) NOT NULL,
+                from_date DATE NULL,
+                to_date DATE NULL,
+                reason TEXT,
+                changed_by VARCHAR(150) NOT NULL DEFAULT '',
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                UNIQUE KEY uniq_patient_cycle_stage (patient_id, cycle_key, stage_key)
+            )
+        """)
+
+
+@csrf_exempt
+def save_stage_date_change(request):
+    if request.method != 'POST':
+        return JsonResponse({'status': 'error', 'message': 'Use POST.'}, status=405)
+    try:
+        data = json.loads(request.body)
+        patient_id = str(data.get('patient_id') or '').strip()
+        cycle_key = str(data.get('cycle_key') or '').strip()[:255]
+        stage_key = str(data.get('stage_key') or '').strip()[:100]
+        from_date = str(data.get('from_date') or '').strip()[:10] or None
+        to_date = str(data.get('to_date') or '').strip()[:10] or None
+        reason = str(data.get('reason') or '').strip()
+        user = str(data.get('user') or '').strip()[:150]
+        role = str(data.get('role') or '').strip()
+        if role == 'view_only':
+            return JsonResponse({'status': 'error', 'message': 'View-only access - you cannot make changes.'}, status=403)
+        if not patient_id or not stage_key or not from_date or not to_date:
+            return JsonResponse({'status': 'error', 'message': 'patient_id, stage and dates are required.'}, status=400)
+        if to_date < from_date:
+            return JsonResponse({'status': 'error', 'message': 'TO date cannot be before FROM date.'}, status=400)
+        if not reason:
+            return JsonResponse({'status': 'error', 'message': 'Please enter the reason for the change.'}, status=400)
+        ensure_stage_date_change_table()
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                INSERT INTO reports_stagedatechange (patient_id, cycle_key, stage_key, from_date, to_date, reason, changed_by)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE from_date = VALUES(from_date), to_date = VALUES(to_date),
+                                        reason = VALUES(reason), changed_by = VALUES(changed_by)
+            """, [patient_id, cycle_key, stage_key, from_date, to_date, reason, user])
+        return JsonResponse({'status': 'success', 'message': 'Dates saved.'})
+    except Exception as e:
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+
+
+@csrf_exempt
+def get_stage_date_changes(request):
+    patient_id = str(request.GET.get('patient_id') or '').strip()
+    if not patient_id:
+        return JsonResponse({'status': 'success', 'changes': []})
+    try:
+        ensure_stage_date_change_table()
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT cycle_key, stage_key, from_date, to_date, reason, changed_by, updated_at
+                FROM reports_stagedatechange WHERE patient_id = %s
+            """, [patient_id])
+            changes = [
+                {'cycle_key': r[0] or '', 'stage_key': r[1],
+                 'from_date': r[2].strftime('%Y-%m-%d') if r[2] else '',
+                 'to_date': r[3].strftime('%Y-%m-%d') if r[3] else '',
+                 'reason': r[4] or '', 'changed_by': r[5] or '',
+                 'updated_at': r[6].strftime('%d-%b-%y %I:%M %p') if r[6] else ''}
+                for r in cursor.fetchall()
+            ]
+        return JsonResponse({'status': 'success', 'changes': changes})
     except Exception as e:
         return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
 
@@ -1852,6 +2001,7 @@ def get_aging_snapshot(request):
             AND p.remaining_amount > 0
             AND p.on_date >= '{DATA_START_DATE}'
             AND (p.status IS NULL OR p.status NOT IN ('cancelled', 'disapproved'))
+            {DS_P}
         {by_centre_filter_sql}
         GROUP BY c.center_number, c.center_name
         ORDER BY c.center_name ASC;
@@ -1887,6 +2037,8 @@ def get_aging_snapshot(request):
         WHERE p.remaining_amount > 0
           AND p.on_date >= '{DATA_START_DATE}'
           AND (p.status IS NULL OR p.status NOT IN ('cancelled', 'disapproved'))
+          {DS_P}
+          {DS_A_ROW}
           {patients_filter_sql}
         ORDER BY p.on_date DESC;
     """
@@ -2081,6 +2233,73 @@ def get_aging_snapshot(request):
 # ============================================================
 
 @csrf_exempt
+def _php_unserialize(raw):
+    """Minimal PHP unserialize (arrays / strings / ints) for hms_doctor_consultation list columns."""
+    b = raw if isinstance(raw, bytes) else str(raw).encode('utf-8')
+    pos = 0
+
+    def parse():
+        nonlocal pos
+        t = b[pos:pos + 1]
+        if t == b'N':
+            pos += 2
+            return None
+        if t in (b'i', b'd', b'b'):
+            end = b.index(b';', pos)
+            v = b[pos + 2:end]
+            pos = end + 1
+            return float(v) if t == b'd' else int(v)
+        if t == b's':
+            colon = b.index(b':', pos + 2)
+            n = int(b[pos + 2:colon])
+            start = colon + 2
+            v = b[start:start + n]
+            pos = start + n + 2
+            return v.decode('utf-8', 'ignore')
+        if t == b'a':
+            colon = b.index(b':', pos + 2)
+            n = int(b[pos + 2:colon])
+            pos = colon + 2
+            out = {}
+            for _ in range(n):
+                k = parse()
+                out[k] = parse()
+            pos += 1
+            return out
+        raise ValueError('unsupported serialized value')
+
+    return parse()
+
+
+def _advised_procedure_ids(raw):
+    """Procedure IDs (hms_procedures.ID) from hms_doctor_consultation.sub_procedure_suggestion_list.
+    The column is a PHP-serialized array whose items are procedure IDs (an item may itself be a
+    comma-separated list of IDs); a plain '12,34' string is accepted too."""
+    ids = []
+
+    def collect(v):
+        if isinstance(v, dict):
+            for x in v.values():
+                collect(x)
+        elif isinstance(v, int):
+            if v > 0:
+                ids.append(v)
+        elif isinstance(v, str):
+            for part in v.split(','):
+                part = part.strip()
+                if part.isdigit() and int(part) > 0:
+                    ids.append(int(part))
+
+    if not raw:
+        return ids
+    try:
+        collect(_php_unserialize(raw))
+    except Exception:
+        collect(str(raw))
+    seen = set()
+    return [i for i in ids if not (i in seen or seen.add(i))]
+
+
 def get_prebook_data(request):
     center_id = request.GET.get('center_id')
     appt_centre_filter_sql = "AND a.center = %s" if center_id else ""
@@ -2097,6 +2316,7 @@ def get_prebook_data(request):
         LEFT JOIN hms_centers c ON a.center = c.center_number
         WHERE a.status = 'booked'
           AND a.appoitmented_date >= '{DATA_START_DATE}'
+          {DS_A}
           {appt_centre_filter_sql}
         ORDER BY a.appoitmented_date DESC;
     """
@@ -2111,6 +2331,7 @@ def get_prebook_data(request):
         LEFT JOIN hms_centers c ON a.center = c.center_number
         WHERE a.status = 'no_show'
           AND a.appoitmented_date >= '{DATA_START_DATE}'
+          {DS_A}
           {appt_centre_filter_sql}
         ORDER BY a.appoitmented_date DESC;
     """
@@ -2131,6 +2352,7 @@ def get_prebook_data(request):
             c.center_name AS centre,
             d.name AS doctor,
             hc.reason_of_visit AS treatment,
+            hc.appointment_id AS appointment_id,
             r.quality AS saved_quality,
             r.fc_comment AS saved_fc_comment,
             r.latest_connected_date AS saved_last_conn,
@@ -2152,6 +2374,8 @@ def get_prebook_data(request):
                 )
               )
           AND hc.on_date >= '{DATA_START_DATE}'
+          {DS_A}
+          {DS_HC}
           {cnb_centre_filter_sql}
         ORDER BY hc.on_date DESC;
     """
@@ -2189,7 +2413,38 @@ def get_prebook_data(request):
         # A patient can have several hms_consultation rows (one per suggested procedure/visit);
         # collapse to a single row per patient, keeping the most recent (query is ORDER BY date DESC).
         seen_cnb_ids = set()
-        for row in run(cnb_query):
+        cnb_rows = run(cnb_query)
+
+        # "Treatment advised" = the procedures the doctor advised in that consultation
+        # (hms_doctor_consultation.sub_procedure_suggestion_list -> hms_procedures.procedure_name).
+        advised_by_appt = {}
+        appt_ids = sorted({int(r["appointment_id"]) for r in cnb_rows if str(r.get("appointment_id") or "").isdigit()})
+        if appt_ids:
+            ph = ", ".join(["%s"] * len(appt_ids))
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"SELECT appointment_id, sub_procedure_suggestion_list FROM hms_doctor_consultation "
+                    f"WHERE appointment_id IN ({ph}) ORDER BY ID ASC", appt_ids)
+                for appt_id, raw in cursor.fetchall():
+                    ids = _advised_procedure_ids(raw)
+                    if ids:
+                        advised_by_appt[int(appt_id)] = ids  # latest non-empty advice wins
+        all_ids = sorted({i for ids in advised_by_appt.values() for i in ids})
+        proc_names = {}
+        if all_ids:
+            ph = ", ".join(["%s"] * len(all_ids))
+            with connection.cursor() as cursor:
+                cursor.execute(f"SELECT ID, procedure_name FROM hms_procedures WHERE ID IN ({ph})", all_ids)
+                proc_names = {int(i): (n or "").strip() for i, n in cursor.fetchall()}
+
+        def advised_list(appt):
+            try:
+                ids = advised_by_appt.get(int(appt), [])
+            except (TypeError, ValueError):
+                ids = []
+            return [proc_names[i] for i in ids if proc_names.get(i)]
+
+        for row in cnb_rows:
             if row["id"] in seen_cnb_ids:
                 continue
             seen_cnb_ids.add(row["id"])
@@ -2200,7 +2455,8 @@ def get_prebook_data(request):
                 "centre": row["centre"] or "Unassigned",
                 "type": "cnb",
                 "doctor": row["doctor"] or "",
-                "treatment": row["treatment"] or "",
+                "treatment": ", ".join(advised_list(row.get("appointment_id"))),
+                "treatments": advised_list(row.get("appointment_id")),
                 "quality": row["saved_quality"] or "",
                 "fcComment": row["saved_fc_comment"] or "",
                 "lastConn": iso(row["saved_last_conn"]),
@@ -2252,6 +2508,7 @@ def get_red_triggers(request):
         LEFT JOIN hms_centers c ON j.centre_booking REGEXP '^[0-9]+$' AND c.center_number = CAST(j.centre_booking AS UNSIGNED)
         WHERE j.balance_amount > 0
           AND j.booking_date IS NOT NULL
+          {DS_J}
           {centre_filter_sql}
         ORDER BY j.balance_amount DESC;
     """
@@ -2361,6 +2618,7 @@ def get_stage_patients(request):
         FROM hms_patient_journey j
         LEFT JOIN hms_centers c ON j.centre_booking REGEXP '^[0-9]+$' AND c.center_number = CAST(j.centre_booking AS UNSIGNED)
         WHERE j.booking_date IS NOT NULL
+          {DS_J}
           {journey_filter_sql}
         ORDER BY j.booking_date DESC;
     """
@@ -2435,6 +2693,7 @@ def get_dashboard_summary(request):
                 COALESCE(SUM(CASE WHEN MONTH(p.on_date) = MONTH(CURDATE()) AND YEAR(p.on_date) = YEAR(CURDATE()) THEN p.totalpackage ELSE 0 END), 0) AS exp_month
             FROM hms_patient_procedure p
             WHERE (p.status IS NULL OR p.status NOT IN ('cancelled', 'disapproved'))
+              {DS_P}
               {billing_filter_sql}
         """
         with connection.cursor() as cursor:
@@ -2449,6 +2708,7 @@ def get_dashboard_summary(request):
             FROM hms_patient_payments pay
             INNER JOIN hms_patient_procedure p ON p.receipt_number = pay.billing_id
             WHERE pay.status IN ('0', '1')
+              {DS_P}
               {billing_filter_sql}
         """
         with connection.cursor() as cursor:
@@ -2461,6 +2721,7 @@ def get_dashboard_summary(request):
             INNER JOIN hms_patient_procedure p ON p.receipt_number = pay.billing_id
             WHERE pay.status IN ('0', '1')
               AND pay.on_date >= DATE_SUB(CURDATE(), INTERVAL 6 DAY)
+              {DS_P}
               {billing_filter_sql}
             GROUP BY DATE(pay.on_date)
             ORDER BY d ASC
@@ -2476,6 +2737,7 @@ def get_dashboard_summary(request):
         triggers_count_query = f"""
             SELECT COUNT(*) FROM hms_patient_journey
             WHERE balance_amount > 0 AND booking_date IS NOT NULL
+            {ds_not('patient_id')}
             {journey_filter_sql}
         """
         with connection.cursor() as cursor:
@@ -2484,7 +2746,11 @@ def get_dashboard_summary(request):
 
         ensure_aging_followup_table()
         with connection.cursor() as cursor:
-            cursor.execute("SELECT COUNT(*) FROM reports_agingfollowup WHERE status = %s", ['Cancellation Request'])
+            cursor.execute(
+                "SELECT COUNT(*) FROM reports_agingfollowup f WHERE f.status = %s "
+                "AND f.invoice NOT IN (SELECT p.receipt_number FROM hms_patient_procedure p WHERE p.receipt_number IS NOT NULL "
+                "AND " + ds_in("p.patient_id") + ")",
+                ['Cancellation Request'])
             approvals_pending = cursor.fetchone()[0]
 
         stage_query = f"""
@@ -2494,6 +2760,7 @@ def get_dashboard_summary(request):
             FROM hms_patient_journey j
             LEFT JOIN hms_centers c ON j.centre_booking REGEXP '^[0-9]+$' AND c.center_number = CAST(j.centre_booking AS UNSIGNED)
             WHERE j.booking_date IS NOT NULL
+              {DS_J}
               {journey_filter_sql}
         """
         with connection.cursor() as cursor:
@@ -3190,7 +3457,9 @@ def aging_notifications(request):
     try:
         _ensure_notif_table()
         with connection.cursor() as cursor:
-            cursor.execute("SELECT id, invoice, patient_id, text, created_at FROM reports_agingnotif ORDER BY id DESC LIMIT 25")
+            cursor.execute(
+                "SELECT n.id, n.invoice, n.patient_id, n.text, n.created_at FROM reports_agingnotif n WHERE 1=1 "
+                + ds_not("n.patient_id") + " ORDER BY n.id DESC LIMIT 25")
             rows = cursor.fetchall()
         items = [{'id': r[0], 'invoice': r[1], 'patientId': r[2], 'text': r[3] or '',
                   'at': r[4].strftime('%Y-%m-%dT%H:%M:%S') if r[4] else ''} for r in rows]

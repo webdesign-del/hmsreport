@@ -44,6 +44,7 @@ export interface PrebookPatient {
   type: PrebookType;
   doctor?: string;
   treatment?: string;
+  treatments?: string[];
   quality?: "Hot" | "Cold" | "Dead";
   fcComment?: string;
   lastConn?: string;

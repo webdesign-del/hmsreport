@@ -81,8 +81,22 @@ WSGI_APPLICATION = 'config.wsgi.application'
 # ============================================================
 # DATABASE CONFIGURATION FOR PHP MYSQL (XAMPP / MARIADB)
 # ============================================================
+#DATABASES = {
+#    'default': {
+#        'ENGINE': 'django.db.backends.mysql',
+#        'NAME': 'hmsindiaivf',     # PHP Database Name
+#        'USER': 'root',          
+#        'PASSWORD': '',          
+#        'HOST': '127.0.0.1',     
+#        'PORT': '3306',
+#        'OPTIONS': {
+#            'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
+#        }
+#    }
+#}
+
 DATABASES = {
-    'default': {
+   'default': {
         'ENGINE': 'django.db.backends.mysql',
         'NAME': 'hmsindiaivf',     # PHP Database Name
         'USER': 'hmsindiaivf',          
@@ -93,7 +107,7 @@ DATABASES = {
             'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
         }
     }
-}
+ }
 
 
 # ============================================================

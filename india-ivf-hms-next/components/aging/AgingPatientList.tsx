@@ -53,6 +53,11 @@ function effectiveStatus(p: AgingPatient): string {
   return p.statusOverride || p.autoStatus || "";
 }
 
+/** A follow-up status managed by the Action menu (not Active / On Hold) - the popup must not overwrite it. */
+function isWorkflowStatus(status: string): boolean {
+  return (FOLLOWUP_STATUSES as readonly string[]).includes(status) && status !== "Active" && status !== "On Hold";
+}
+
 function statusBadgeClass(status: string): string {
   switch (status) {
     case "Treatment Completed":
@@ -541,7 +546,9 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
 
   function openFollowUp(p: AgingPatient) {
     setFollowUpTarget(p);
-    setFollowUpStatus((FOLLOWUP_STATUSES as readonly string[]).includes(p.status) ? p.status : FOLLOWUP_STATUSES[0]);
+    // Follow-up popup only switches a case between Active and On Hold; any other (workflow) status is kept.
+    // (p.status can also be the procedure status when no follow-up exists yet -> treated as Active.)
+    setFollowUpStatus(p.status === "On Hold" ? "On Hold" : isWorkflowStatus(p.status) ? "" : "Active");
     setFollowUpRemarks("");
     setFollowUpDate("");
     setSaveError("");
@@ -566,7 +573,8 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
         body: JSON.stringify({
           invoice: followUpTarget.invoice,
           patient_id: followUpTarget.id,
-          status: followUpStatus,
+          status: followUpStatus || followUpTarget.status || "Active",
+          set_status: followUpStatus === "Active" || followUpStatus === "On Hold",
           followup_only: true,
           remarks: followUpRemarks.trim(),
           next_date: followUpDate,
@@ -585,6 +593,7 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
                 ...p,
                 lastFu: TODAY,
                 nextFu: followUpDate,
+                status: followUpStatus === "Active" || followUpStatus === "On Hold" ? followUpStatus : p.status,
                 fuOverdue: false,
                 fuOverdueDays: 0,
                 history: logLine ? (p.history ? `${logLine}\n${p.history}` : logLine) : p.history,
@@ -1186,6 +1195,19 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
             <div className="mb-4 text-[11.5px] text-text-soft">
               {followUpTarget.id} · Invoice {followUpTarget.invoice || "—"}
             </div>
+
+            <label className="mb-1 block text-[11.5px] font-semibold text-text-mid">Status</label>
+            <select
+              value={followUpStatus}
+              onChange={(e) => setFollowUpStatus(e.target.value)}
+              className="mb-3 w-full rounded-[8px] border border-border bg-surface px-3 py-2 text-[12.5px] outline-none focus:border-primary"
+            >
+              {isWorkflowStatus(followUpTarget.status) && (
+                <option value="">Keep current ({followUpTarget.status})</option>
+              )}
+              <option value="Active">Active</option>
+              <option value="On Hold">On Hold</option>
+            </select>
 
             <label className="mb-1 block text-[11.5px] font-semibold text-text-mid">Next follow-up date</label>
             <input
