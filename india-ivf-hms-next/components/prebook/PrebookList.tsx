@@ -48,7 +48,10 @@ interface CnbEdit {
 type SaveState = "saving" | "saved" | "error";
 
 export default function PrebookList({ type, prebook }: { type: PrebookType; prebook: PrebookPatient[] }) {
-  const [range, setRange] = useState("today");
+  // Missed appointments are always in the past, so "today" would always be empty - default them to all time.
+  const defaultRange = type === "missed" ? "all" : "today";
+  const [range, setRange] = useState(defaultRange);
+  const [centreFilter, setCentreFilter] = useState("all");
   const [fromDate, setFromDate] = useState("");
   const [toDate, setToDate] = useState("");
   const [doctorFilter, setDoctorFilter] = useState("all");
@@ -62,6 +65,10 @@ export default function PrebookList({ type, prebook }: { type: PrebookType; preb
 
   // Filter choices come from this page's own patients (Consulted Not Booked only).
   const typeRows = useMemo(() => prebook.filter((p) => p.type === type), [prebook, type]);
+  const centreOptions = useMemo(
+    () => Array.from(new Set<string>(typeRows.map((p) => (p.centre || "").trim()).filter(Boolean))).sort((a: string, b: string) => a.localeCompare(b)),
+    [typeRows]
+  );
   const doctorOptions = useMemo(
     () => Array.from(new Set<string>(typeRows.map((p) => (p.doctor || "").trim()).filter(Boolean))).sort((a: string, b: string) => a.localeCompare(b)),
     [typeRows]
@@ -82,6 +89,7 @@ export default function PrebookList({ type, prebook }: { type: PrebookType; preb
         if (q && !String(p.id || "").toLowerCase().includes(q) && !String(p.name || "").toLowerCase().includes(q)) return false;
         // While searching, the date range is ignored so an ID is found whatever its consult date.
         if (!q && !inRange(p.date, range, fromDate, toDate)) return false;
+        if (centreFilter !== "all" && (p.centre || "").trim() !== centreFilter) return false;
         if (type === "cnb") {
           // saved quality (a row with nothing saved yet counts as "Cold", same as the dropdown shows)
           if (qualityFilter !== "all" && (p.quality || "Cold") !== qualityFilter) return false;
@@ -94,12 +102,13 @@ export default function PrebookList({ type, prebook }: { type: PrebookType; preb
         }
         return true;
       }),
-    [typeRows, type, search, range, fromDate, toDate, doctorFilter, treatmentFilter, qualityFilter]
+    [typeRows, type, search, range, fromDate, toDate, centreFilter, doctorFilter, treatmentFilter, qualityFilter]
   );
 
-  const filtersActive = search.trim() !== "" || range !== "today" || doctorFilter !== "all" || treatmentFilter !== "all" || qualityFilter !== "all";
+  const filtersActive = search.trim() !== "" || range !== defaultRange || centreFilter !== "all" || doctorFilter !== "all" || treatmentFilter !== "all" || qualityFilter !== "all";
   function clearFilters() {
-    setRange("today");
+    setRange(defaultRange);
+    setCentreFilter("all");
     setFromDate("");
     setToDate("");
     setDoctorFilter("all");
@@ -110,7 +119,7 @@ export default function PrebookList({ type, prebook }: { type: PrebookType; preb
 
   useEffect(() => {
     setPage(1);
-  }, [type, search, range, fromDate, toDate, doctorFilter, treatmentFilter, qualityFilter, pageSize]);
+  }, [type, search, range, fromDate, toDate, centreFilter, doctorFilter, treatmentFilter, qualityFilter, pageSize]);
 
   const totalPages = Math.max(1, Math.ceil(list.length / pageSize));
   const safePage = Math.min(page, totalPages);
@@ -201,6 +210,21 @@ export default function PrebookList({ type, prebook }: { type: PrebookType; preb
                   className="rounded-[9px] border border-border bg-surface px-2.5 py-1.5 text-[11.5px]"
                 />
               </>
+            )}
+            {centreOptions.length > 1 && (
+              <select
+                value={centreFilter}
+                onChange={(e) => setCentreFilter(e.target.value)}
+                className="max-w-[190px] rounded-[9px] border border-border bg-surface px-3 py-1.5 text-[11.5px]"
+                title="Filter by centre"
+              >
+                <option value="all">All centres</option>
+                {centreOptions.map((c) => (
+                  <option key={c} value={c}>
+                    {c}
+                  </option>
+                ))}
+              </select>
             )}
             {type === "cnb" && (
               <>

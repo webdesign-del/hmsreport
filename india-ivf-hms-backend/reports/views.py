@@ -2047,7 +2047,18 @@ def get_aging_snapshot(request):
     center_id = request.GET.get('center_id')
     by_centre_filter_sql = "WHERE c.center_number = %s" if center_id else ""
     patients_filter_sql = "AND p.billing_at = %s" if center_id else ""
-    params = [center_id] if center_id else []
+    centre_params = [center_id] if center_id else []
+
+    # Optional booking-date filter (YYYY-MM-DD). Applies to the buckets, the centre table and the patient list.
+    _iso_re = _re_ds.compile(r'^\d{4}-\d{2}-\d{2}$')
+    date_from = (request.GET.get('date_from') or '').strip()
+    date_to = (request.GET.get('date_to') or '').strip()
+    date_params = []
+    date_sql = ""
+    if _iso_re.match(date_from) and _iso_re.match(date_to):
+        date_sql = "AND DATE(p.on_date) BETWEEN %s AND %s"
+        date_params = [date_from, date_to]
+    params = date_params + centre_params
 
     by_centre_query = f"""
         SELECT
@@ -2062,7 +2073,8 @@ def get_aging_snapshot(request):
             ON p.billing_at = c.center_number
             AND p.remaining_amount > 0
             AND p.on_date >= '{DATA_START_DATE}'
-            AND (p.status IS NULL OR p.status NOT IN ('cancelled', 'disapproved'))
+            AND p.status IN ('pending', 'approved')
+            {date_sql}
             {ds_p()}
         {by_centre_filter_sql}
         GROUP BY c.center_number, c.center_name
@@ -2098,7 +2110,8 @@ def get_aging_snapshot(request):
         LEFT JOIN reports_agingfollowup f ON f.invoice = p.receipt_number
         WHERE p.remaining_amount > 0
           AND p.on_date >= '{DATA_START_DATE}'
-          AND (p.status IS NULL OR p.status NOT IN ('cancelled', 'disapproved'))
+          AND p.status IN ('pending', 'approved')
+          {date_sql}
           {ds_p()}
           {DS_A_ROW}
           {patients_filter_sql}
@@ -2362,6 +2375,41 @@ def _advised_procedure_ids(raw):
     return [i for i in ids if not (i in seen or seen.add(i))]
 
 
+_VISITED_CACHE = {'at': 0.0, 'pids': set(), 'appts': set()}
+
+
+def _visited_patient_sets():
+    """Patients (and appointments) that actually came to the clinic: any in-clinic/visited/consultation
+    appointment status, any hms_consultation row, or any hms_patient_procedure row. Cached for 2 minutes."""
+    now = _time_ds.time()
+    if now - _VISITED_CACHE['at'] < 120 and _VISITED_CACHE['at']:
+        return _VISITED_CACHE['pids'], _VISITED_CACHE['appts']
+    pids, appts = set(), set()
+    with connection.cursor() as cursor:
+        cursor.execute("""
+            SELECT DISTINCT TRIM(paitent_id) FROM hms_appointments
+            WHERE status IN ('in_clinic', 'visited', 'consultation', 'consultation_done')
+              AND paitent_id IS NOT NULL AND TRIM(paitent_id) <> ''
+        """)
+        pids.update(str(r[0]).strip() for r in cursor.fetchall() if r[0])
+        cursor.execute("SELECT DISTINCT TRIM(patient_id), appointment_id FROM hms_consultation")
+        for pid, appt in cursor.fetchall():
+            if pid:
+                pids.add(str(pid).strip())
+            if appt:
+                appts.add(str(appt).strip())
+        cursor.execute("SELECT DISTINCT TRIM(patient_id), appointment_id FROM hms_patient_procedure")
+        for pid, appt in cursor.fetchall():
+            if pid:
+                pids.add(str(pid).strip())
+            if appt:
+                appts.add(str(appt).strip())
+    pids.discard('')
+    appts.discard('')
+    _VISITED_CACHE.update({'at': now, 'pids': pids, 'appts': appts})
+    return pids, appts
+
+
 def get_prebook_data(request):
     center_id = request.GET.get('center_id')
     appt_centre_filter_sql = "AND a.center = %s" if center_id else ""
@@ -2383,15 +2431,22 @@ def get_prebook_data(request):
         ORDER BY a.appoitmented_date DESC;
     """
 
+    # Missed = patient took an appointment (booked / no_show / rescheduled) whose date has passed and the
+    # patient has NEVER come to the clinic (no in-clinic / visited / consultation status, no hms_consultation
+    # and no hms_patient_procedure row). "Never came" is decided in Python from cached id sets (see
+    # _visited_patient_sets) so the SQL stays simple and there are no collation clashes.
     missed_query = f"""
         SELECT
+            a.id AS appt_id,
+            TRIM(a.paitent_id) AS pid,
             COALESCE(NULLIF(TRIM(a.paitent_id), ''), CAST(a.id AS CHAR)) AS id,
             a.wife_name AS name,
             DATE(a.appoitmented_date) AS date,
             c.center_name AS centre
         FROM hms_appointments a
         LEFT JOIN hms_centers c ON a.center = c.center_number
-        WHERE a.status = 'no_show'
+        WHERE a.status IN ('booked', 'no_show', 'rescheduled')
+          AND DATE(a.appoitmented_date) < CURDATE()
           AND a.appoitmented_date >= '{DATA_START_DATE}'
           {ds_a()}
           {appt_centre_filter_sql}
@@ -2464,7 +2519,15 @@ def get_prebook_data(request):
                 "centre": row["centre"] or "Unassigned",
                 "type": "scheduled",
             })
+        visited_pids, visited_appts = _visited_patient_sets()
+        seen_missed = set()
         for row in run(missed_query):
+            pid = str(row.get("pid") or "").strip()
+            if (pid and pid in visited_pids) or str(row.get("appt_id")) in visited_appts:
+                continue  # this patient did come at some point -> not a "never came" case
+            if row["id"] in seen_missed:
+                continue  # one row per patient (latest missed appointment; query is ORDER BY date DESC)
+            seen_missed.add(row["id"])
             results.append({
                 "id": row["id"],
                 "name": row["name"] or "",

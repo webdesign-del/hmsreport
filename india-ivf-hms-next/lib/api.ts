@@ -56,8 +56,16 @@ export interface AgingSnapshotResponse {
   byCentre: { centre: string; buckets: number[]; total: number }[];
   patients: AgingPatient[];
 }
-export const getAgingSnapshot = (centerId?: number | null) =>
-  getJSON<AgingSnapshotResponse>(`/api/aging-snapshot${centerId ? `?center_id=${centerId}` : ""}`);
+export const getAgingSnapshot = (centerId?: number | null, dateFrom?: string, dateTo?: string) => {
+  const qs = new URLSearchParams();
+  if (centerId) qs.set("center_id", String(centerId));
+  if (dateFrom && dateTo) {
+    qs.set("date_from", dateFrom);
+    qs.set("date_to", dateTo);
+  }
+  const q = qs.toString();
+  return getJSON<AgingSnapshotResponse>(`/api/aging-snapshot${q ? `?${q}` : ""}`);
+};
 
 export interface StagePatient {
   id: string;

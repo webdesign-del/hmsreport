@@ -3,13 +3,19 @@ import { getScopedCenterId } from "@/lib/auth";
 import { fmtINR } from "@/lib/format";
 import { Card, PageHead, TableWrap } from "@/components/ui";
 import AgingPatientList from "@/components/aging/AgingPatientList";
+import AgingDateFilter from "@/components/aging/AgingDateFilter";
 
 const BUCKET_LABELS = ["0 – 30 days", "31 – 60 days", "61 – 90 days", "91 – 180 days", "180+ days"];
 const BUCKET_TONE = ["border-t-green", "border-t-blue", "border-t-amber", "border-t-primary", "border-t-red"];
 
-export default async function AgingPage() {
+const ISO = /^\d{4}-\d{2}-\d{2}$/;
+
+export default async function AgingPage({ searchParams }: { searchParams: Promise<{ from?: string; to?: string; range?: string }> }) {
+  const sp = await searchParams;
+  const from = sp.from && ISO.test(sp.from) ? sp.from : "";
+  const to = sp.to && ISO.test(sp.to) ? sp.to : "";
   const centerId = await getScopedCenterId();
-  const { companyBuckets, bucketCounts, byCentre, patients: agingPatients } = await getAgingSnapshot(centerId);
+  const { companyBuckets, bucketCounts, byCentre, patients: agingPatients } = await getAgingSnapshot(centerId, from, to);
   const activeByCentre = byCentre.filter((c) => c.total !== 0);
 
   return (
@@ -20,7 +26,7 @@ export default async function AgingPage() {
         actions={<span className="rounded-full bg-green-soft px-2.5 py-1 text-[10px] font-bold uppercase tracking-wide text-green">Live data</span>}
       />
 
-      <Card title="Company Aging">
+      <Card title="Company Aging" tools={<AgingDateFilter range={sp.range || (from && to ? "custom" : "all")} from={from} to={to} />}>
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
           {companyBuckets.map((v, i) => (
             <div key={i} className={`rounded-[12px] border border-border border-t-[3px] bg-surface-2 p-3.5 ${BUCKET_TONE[i]}`}>
