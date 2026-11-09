@@ -426,7 +426,8 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
   // them here (all booked procedures, including the hidden IP218/IP219 rows).
   const totalGross = procedures.reduce((sum: number, p: any) => sum + (Number(p.fees) || 0), 0);
   const totalReceived = procedures.reduce((sum: number, p: any) => sum + (Number(p.payment_done) || 0), 0);
-  const totalPending = procedures.reduce((sum: number, p: any) => sum + (Number(p.pending) || 0), 0);
+  // Pending is never shown negative (an over-collected procedure counts as 0 pending).
+  const totalPending = procedures.reduce((sum: number, p: any) => sum + Math.max(0, Number(p.pending) || 0), 0);
   const visibleProcedures = procedures.filter(
     (proc: any) => !HIDDEN_PROCEDURE_CODES.includes(String(proc.code || "").trim().toUpperCase())
   );
@@ -590,7 +591,21 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
     return fmtDMY(String(iso || "").slice(0, 10));
   };
 
-  const sumOf = (list: any[], k: string) => list.reduce((t: number, x: any) => t + (Number(x[k]) || 0), 0);
+  const statusBadge = (st?: string) => {
+    const v = String(st || "").trim().toLowerCase();
+    if (!v) return <span className="text-slate-300">—</span>;
+    const cls =
+      v === "approved"
+        ? "bg-green-100 text-green-700 border-green-300"
+        : v === "pending"
+        ? "bg-amber-100 text-amber-800 border-amber-300"
+        : "bg-slate-100 text-slate-600 border-slate-300";
+    return (
+      <span className={`inline-block rounded-full border px-2 py-0.5 text-[10px] font-bold uppercase ${cls}`}>{v}</span>
+    );
+  };
+  const sumOf = (list: any[], k: string) =>
+    list.reduce((t: number, x: any) => t + (k === "pending" ? Math.max(0, Number(x[k]) || 0) : Number(x[k]) || 0), 0);
 
   const procCategoryMap = new Map<string, { proc: any; idx: number }[]>();
   visibleProcedures.forEach((proc: any, idx: number) => {
@@ -835,6 +850,7 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
                   <th className="p-3">{hideFinancials ? "Code" : "Code (Click to View Partial Payments)"}</th>
                   <th className="p-3">Procedure Name</th>
                   <th className="p-3">Receipt No</th>
+                  <th className="p-3">Status</th>
                   {!hideFinancials && (
                     <>
                       <th className="p-3 text-right">Fees</th>
@@ -855,7 +871,7 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
                         className="cursor-pointer border-b border-border bg-slate-100 hover:bg-slate-200/70 transition"
                         title={item.collapsed ? "Click to expand category" : "Click to collapse category"}
                       >
-                        <td colSpan={hideFinancials ? 6 : 6} className="p-2.5 text-[11px] font-bold uppercase tracking-wide text-slate-700">
+                        <td colSpan={7} className="p-2.5 text-[11px] font-bold uppercase tracking-wide text-slate-700">
                           <span className={`mr-2 inline-block transition-transform ${item.collapsed ? "" : "rotate-90"}`}>▶</span>
                           {item.cat}
                           <span className="ml-2 rounded-full bg-white px-2 py-0.5 text-[10px] font-semibold text-text-soft normal-case">
@@ -877,7 +893,7 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
                   const { proc, idx } = item;
                   const procKey = proc.procedure_entry_id ?? proc.ID ?? `${proc.code}-${idx}`;
                   const isExpanded = expandedProcKey === procKey;
-                  const colCount = hideFinancials ? 6 : 9;
+                  const colCount = hideFinancials ? 7 : 10;
 
                   // This procedure's own forms — same classification helpers used
                   // by the Clinical Journey Stages table below, so a form reads the
@@ -920,7 +936,7 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
                                   receiptNo: proc.receipt_number,
                                   fees: proc.fees,
                                   paymentDone: proc.payment_done,
-                                  pending: proc.pending,
+                                  pending: Math.max(0, Number(proc.pending) || 0),
                                   breakups: proc.payment_breakups || [],
                                 });
                               }}
@@ -934,6 +950,7 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
                         </td>
                         <td className="p-3 font-bold text-text-dark">{proc.procedure_name || "—"}</td>
                         <td className="p-3 text-text-soft">{proc.receipt_number || "—"}</td>
+                        <td className="p-3">{statusBadge(proc.status)}</td>
                         {!hideFinancials && (
                           <>
                             <td className="p-3 text-right font-medium">₹ {proc.fees?.toLocaleString("en-IN")}</td>
@@ -945,7 +962,7 @@ export default function JourneyView({ initialId = "" }: JourneyViewProps) {
                                 proc.pending > 0 ? "text-red-500" : "text-green-600"
                               }`}
                             >
-                              ₹ {proc.pending?.toLocaleString("en-IN")}
+                              ₹ {Math.max(0, Number(proc.pending) || 0).toLocaleString("en-IN")}
                             </td>
                           </>
                         )}
@@ -2087,6 +2104,7 @@ return (
                     <th className="p-2.5">Payment Date</th>
                     <th className="p-2.5">Receipt / Transaction No</th>
                     <th className="p-2.5">Payment Mode</th>
+                    <th className="p-2.5">Status</th>
                     <th className="p-2.5 text-right">Received Amount</th>
                   </tr>
                 </thead>
@@ -2102,6 +2120,7 @@ return (
                             {item.mode || "Cash"}
                           </span>
                         </td>
+                        <td className="p-2.5">{statusBadge(item.status)}</td>
                         <td className="p-2.5 text-right font-bold text-green-600">
                           ₹ {item.amount?.toLocaleString("en-IN")}
                         </td>
@@ -2109,7 +2128,7 @@ return (
                     ))
                   ) : (
                     <tr>
-                      <td colSpan={5} className="p-6 text-center text-slate-400 italic">
+                      <td colSpan={6} className="p-6 text-center text-slate-400 italic">
                         No partial payment records found for this receipt.
                       </td>
                     </tr>

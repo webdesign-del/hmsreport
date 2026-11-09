@@ -504,7 +504,7 @@ def get_dynamic_booked_patients(request):
             GROUP_CONCAT(DISTINCT p.code SEPARATOR ', ') AS code,
             SUM(p.fees) AS fees,
             (COALESCE(SUM(pay_clean.total_paid), 0) + COALESCE(SUM(p.payment_done), 0)) AS total_payment_done,
-            (SUM(p.fees) - COALESCE(SUM(pay_clean.total_paid), 0) - COALESCE(SUM(p.payment_done), 0)) AS pending_amount
+            GREATEST(SUM(p.fees) - COALESCE(SUM(pay_clean.total_paid), 0) - COALESCE(SUM(p.payment_done), 0), 0) AS pending_amount
         FROM hms_appointments a
         INNER JOIN hms_patient_procedure p ON a.id = p.appointment_id
         LEFT JOIN hms_doctor_consultation dc ON a.id = dc.appointment_id
@@ -627,7 +627,10 @@ def get_patient_profile_detail(request):
             proc.fees,
             proc.on_date,
             (IFNULL(proc.payment_done, 0) + IFNULL(pay_clean.total_paid, 0)) AS payment_done,
-            (proc.fees - IFNULL(proc.payment_done, 0) - IFNULL(pay_clean.total_paid, 0)) AS pending,
+            GREATEST(proc.fees - IFNULL(proc.payment_done, 0) - IFNULL(pay_clean.total_paid, 0), 0) AS pending,
+            proc.status AS proc_status,
+            IFNULL(proc.payment_done, 0) AS initial_paid,
+            proc.payment_method AS initial_method,
             GROUP_CONCAT(DISTINCT pf.ID SEPARATOR '||') AS form_ids,
             GROUP_CONCAT(DISTINCT pf.form_name SEPARATOR '||') AS form_names,
             GROUP_CONCAT(DISTINCT pf.form_area SEPARATOR '||') AS form_areas,
@@ -638,7 +641,7 @@ def get_patient_profile_detail(request):
             GROUP_CONCAT(DISTINCT cf.form_name SEPARATOR '||') AS concern_form_names,
             GROUP_CONCAT(DISTINCT IFNULL(cf.form_for, '') SEPARATOR '||') AS concern_form_fors,
             GROUP_CONCAT(DISTINCT IFNULL(cf.type, '') SEPARATOR '||') AS concern_form_types,
-            GROUP_CONCAT(DISTINCT CONCAT(IFNULL(pay_hist.on_date, ''), '::', IFNULL(pay_hist.billing_id, ''), '::', IFNULL(pay_hist.payment_done, 0), '::Cash') SEPARATOR '||') AS payment_history
+            GROUP_CONCAT(DISTINCT CONCAT(IFNULL(pay_hist.on_date, ''), '::', IFNULL(pay_hist.billing_id, ''), '::', IFNULL(pay_hist.payment_done, 0), '::Cash::', IFNULL(pay_hist.status, '')) SEPARATOR '||') AS payment_history
         FROM hms_patient_procedure proc
         LEFT JOIN hms_procedures proc_master ON proc.procedure_id = proc_master.ID
         LEFT JOIN hms_form_relationship fr ON proc.procedure_id = fr.procedure_id
@@ -758,15 +761,30 @@ def get_patient_profile_detail(request):
                 # Payment Breakups
                 raw_pay_history = p_dict['payment_history'].split('||') if p_dict.get('payment_history') else []
                 payment_breakups = []
+                # The amount paid at booking is part of "Received" too, so list it first.
+                initial_paid = float(p_dict.get('initial_paid') or 0)
+                if initial_paid > 0:
+                    payment_breakups.append({
+                        'date': str(p_dict.get('on_date') or ''),
+                        'receipt_no': p_dict.get('receipt_number') or '',
+                        'amount': initial_paid,
+                        'mode': str(p_dict.get('initial_method') or 'Cash').replace('_', ' ').title(),
+                        'status': str(p_dict.get('proc_status') or '').title(),
+                    })
                 for ph in raw_pay_history:
                     parts = ph.split('::')
-                    if len(parts) == 4 and float(parts[2] or 0) > 0:
+                    if len(parts) >= 4 and float(parts[2] or 0) > 0:
+                        pay_status = {'0': 'Pending', '1': 'Approved'}.get(parts[4].strip() if len(parts) > 4 else '', '')
                         payment_breakups.append({
                             'date': parts[0],
                             'receipt_no': parts[1],
                             'amount': float(parts[2]),
-                            'mode': parts[3]
+                            'mode': parts[3],
+                            'status': pay_status
                         })
+                p_dict['status'] = str(p_dict.get('proc_status') or '').title()
+                for _k in ('proc_status', 'initial_paid', 'initial_method'):
+                    p_dict.pop(_k, None)
                 p_dict['payment_breakups'] = payment_breakups
 
                 # Forms Array
