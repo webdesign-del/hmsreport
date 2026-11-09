@@ -503,8 +503,8 @@ def get_dynamic_booked_patients(request):
             MIN(d.name) AS doctor_name,
             GROUP_CONCAT(DISTINCT p.code SEPARATOR ', ') AS code,
             SUM(p.fees) AS fees,
-            COALESCE(SUM(pay_clean.total_paid), 0) AS total_payment_done,
-            (SUM(p.fees) - COALESCE(SUM(pay_clean.total_paid), 0)) AS pending_amount
+            (COALESCE(SUM(pay_clean.total_paid), 0) + COALESCE(SUM(p.payment_done), 0)) AS total_payment_done,
+            (SUM(p.fees) - COALESCE(SUM(pay_clean.total_paid), 0) - COALESCE(SUM(p.payment_done), 0)) AS pending_amount
         FROM hms_appointments a
         INNER JOIN hms_patient_procedure p ON a.id = p.appointment_id
         LEFT JOIN hms_doctor_consultation dc ON a.id = dc.appointment_id
@@ -608,6 +608,9 @@ def get_patient_profile_detail(request):
     """
 
     # 4. Procedures & Payment History
+    # received = paid at booking (hms_patient_procedure.payment_done) + later partial payments
+    # (hms_patient_payments, status 0/1) - the same rule as the HMS "Patient Billings" screen, so
+    # Pending here equals its Balance amount.
     procedures_query = """
         SELECT 
             proc.ID AS procedure_entry_id,
@@ -623,8 +626,8 @@ def get_patient_profile_detail(request):
             proc_master.cycle AS cycle_stage_label,
             proc.fees,
             proc.on_date,
-            IFNULL(pay_clean.total_paid, 0) AS payment_done,
-            (proc.fees - IFNULL(pay_clean.total_paid, 0)) AS pending,
+            (IFNULL(proc.payment_done, 0) + IFNULL(pay_clean.total_paid, 0)) AS payment_done,
+            (proc.fees - IFNULL(proc.payment_done, 0) - IFNULL(pay_clean.total_paid, 0)) AS pending,
             GROUP_CONCAT(DISTINCT pf.ID SEPARATOR '||') AS form_ids,
             GROUP_CONCAT(DISTINCT pf.form_name SEPARATOR '||') AS form_names,
             GROUP_CONCAT(DISTINCT pf.form_area SEPARATOR '||') AS form_areas,
