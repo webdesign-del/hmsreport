@@ -3584,10 +3584,18 @@ def aging_notifications(request):
     """GET -> {maxId, items: [{id, invoice, patientId, text, at}]} (newest first, last 25)."""
     try:
         _ensure_notif_table()
+        # Centre scoping: a counsellor / centre user only gets comments on invoices billed at their own centre.
+        center_id = (request.GET.get('center_id') or '').strip()
+        centre_sql = ""
+        params = []
+        if center_id:
+            centre_sql = (" AND EXISTS (SELECT 1 FROM hms_patient_procedure p"
+                          " WHERE p.receipt_number = n.invoice AND p.billing_at = %s)")
+            params = [center_id]
         with connection.cursor() as cursor:
             cursor.execute(
                 "SELECT n.id, n.invoice, n.patient_id, n.text, n.created_at FROM reports_agingnotif n WHERE 1=1 "
-                + ds_not("n.patient_id") + " ORDER BY n.id DESC LIMIT 25")
+                + ds_not("n.patient_id") + centre_sql + " ORDER BY n.id DESC LIMIT 25", params)
             rows = cursor.fetchall()
         items = [{'id': r[0], 'invoice': r[1], 'patientId': r[2], 'text': r[3] or '',
                   'at': r[4].strftime('%Y-%m-%dT%H:%M:%S') if r[4] else ''} for r in rows]
