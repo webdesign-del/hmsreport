@@ -173,7 +173,7 @@ export default function PrebookList({ type, prebook }: { type: PrebookType; preb
         title={LABELS[type]}
         sub={`${list.length} patient${list.length !== 1 ? "s" : ""} · ${
           range === "custom" ? (fromDate || toDate ? `${fromDate || "…"} to ${toDate || "…"}` : "custom dates") : RANGE_LABELS[range]
-        } · click an IIC ID to open the patient journey`}
+        }${type === "missed" || type === "scheduled" ? "" : " · click an IIC ID to open the patient journey"}`}
         actions={
           <>
             <input
@@ -411,9 +411,14 @@ export default function PrebookList({ type, prebook }: { type: PrebookType; preb
                   <tr key={`${p.id}-${pageStart + n}`}>
                     <td className="sn-col">{pageStart + n + 1}</td>
                     <td>
-                      <Link href={`/journey?id=${p.id}`} className="iic-link">
-                        {p.id}
-                      </Link>
+                      {type === "missed" || type === "scheduled" ? (
+                        // Missed / scheduled patients have not been billed yet, so there is no journey to open.
+                        <span>{p.id}</span>
+                      ) : (
+                        <Link href={`/journey?id=${p.id}`} className="iic-link">
+                          {p.id}
+                        </Link>
+                      )}
                     </td>
                     <td className="strong">{p.name}</td>
                     <td>{fmtDate(p.date)}</td>
