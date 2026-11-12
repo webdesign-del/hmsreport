@@ -109,6 +109,8 @@ export interface AgingPatient {
   gross: number;
   discPct: number;
   incGst: number;
+  /** Aging list: outstanding after approved / pending partial payments (from the backend) */
+  outstanding?: number;
   milestone: string;
   daysOverdue: number;
   lastFu: string;

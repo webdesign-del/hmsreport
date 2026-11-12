@@ -437,7 +437,7 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
       origin: typeof window !== "undefined" ? window.location.origin : "",
       role: role || "",
       // context for the notification email
-      ctx: { name: p.name, centre: p.salesCentre || p.centre, pkg: p.pkg, outstanding: p.incGst - paymentsTotal(p), collected: paymentsTotal(p) },
+      ctx: { name: p.name, centre: p.salesCentre || p.centre, pkg: p.pkg, outstanding: p.outstanding ?? p.incGst - paymentsTotal(p), collected: paymentsTotal(p) },
     };
 
     if (kind === "likely") {
@@ -948,7 +948,7 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
             {paged.map((p, i) => {
               const [exGst, gst] = patientGstSplit(p);
               const totalColl = paymentsTotal(p);
-              const totalOut = p.incGst - totalColl;
+              const totalOut = p.outstanding ?? p.incGst - totalColl;
               const discAmt = pkgDisc(p);
               const inFy2627 = p.signup >= "2026-04-01";
               const balFy2627 = inFy2627 ? totalOut : 0;

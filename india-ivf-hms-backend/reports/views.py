@@ -2060,14 +2060,27 @@ def get_aging_snapshot(request):
         date_params = [date_from, date_to]
     params = date_params + centre_params
 
+    # Outstanding = remaining amount on the procedure minus the partial payments that are approved (1) or
+    # pending approval (0). Disapproved / cancelled payments do not reduce it. The booking-time payment is
+    # already inside remaining_amount; partial payments are not, so they are subtracted here.
+    OUT = "GREATEST(IFNULL(p.remaining_amount, 0) - IFNULL(pay.paid, 0), 0)"
+    PAY_JOIN = """
+        LEFT JOIN (
+            SELECT billing_id, SUM(payment_done) AS paid
+            FROM hms_patient_payments
+            WHERE status IN ('0', '1')
+            GROUP BY billing_id
+        ) pay ON pay.billing_id = p.receipt_number
+    """
+
     by_centre_query = f"""
         SELECT
             c.center_name AS centre,
-            COALESCE(SUM(CASE WHEN DATEDIFF(CURDATE(), p.on_date) <= 30 THEN p.remaining_amount ELSE 0 END), 0) AS b0,
-            COALESCE(SUM(CASE WHEN DATEDIFF(CURDATE(), p.on_date) BETWEEN 31 AND 60 THEN p.remaining_amount ELSE 0 END), 0) AS b1,
-            COALESCE(SUM(CASE WHEN DATEDIFF(CURDATE(), p.on_date) BETWEEN 61 AND 90 THEN p.remaining_amount ELSE 0 END), 0) AS b2,
-            COALESCE(SUM(CASE WHEN DATEDIFF(CURDATE(), p.on_date) BETWEEN 91 AND 180 THEN p.remaining_amount ELSE 0 END), 0) AS b3,
-            COALESCE(SUM(CASE WHEN DATEDIFF(CURDATE(), p.on_date) > 180 THEN p.remaining_amount ELSE 0 END), 0) AS b4
+            COALESCE(SUM(CASE WHEN DATEDIFF(CURDATE(), p.on_date) <= 30 THEN {OUT} ELSE 0 END), 0) AS b0,
+            COALESCE(SUM(CASE WHEN DATEDIFF(CURDATE(), p.on_date) BETWEEN 31 AND 60 THEN {OUT} ELSE 0 END), 0) AS b1,
+            COALESCE(SUM(CASE WHEN DATEDIFF(CURDATE(), p.on_date) BETWEEN 61 AND 90 THEN {OUT} ELSE 0 END), 0) AS b2,
+            COALESCE(SUM(CASE WHEN DATEDIFF(CURDATE(), p.on_date) BETWEEN 91 AND 180 THEN {OUT} ELSE 0 END), 0) AS b3,
+            COALESCE(SUM(CASE WHEN DATEDIFF(CURDATE(), p.on_date) > 180 THEN {OUT} ELSE 0 END), 0) AS b4
         FROM hms_centers c
         LEFT JOIN hms_patient_procedure p
             ON p.billing_at = c.center_number
@@ -2076,6 +2089,7 @@ def get_aging_snapshot(request):
             AND p.status IN ('pending', 'approved')
             {date_sql}
             {ds_p()}
+        {PAY_JOIN}
         {by_centre_filter_sql}
         GROUP BY c.center_number, c.center_name
         ORDER BY c.center_name ASC;
@@ -2093,6 +2107,7 @@ def get_aging_snapshot(request):
             p.totalpackage AS gross,
             p.discount_amount AS discount_amount,
             p.remaining_amount AS remaining_amount,
+            {OUT} AS outstanding,
             DATEDIFF(CURDATE(), p.on_date) AS days_overdue,
             DATE(p.modified_on) AS last_fu,
             p.status AS status,
@@ -2108,7 +2123,9 @@ def get_aging_snapshot(request):
         LEFT JOIN hms_appointments a ON a.id = p.appointment_id
         LEFT JOIN hms_centers c ON p.billing_at = c.center_number
         LEFT JOIN reports_agingfollowup f ON f.invoice = p.receipt_number
+        {PAY_JOIN}
         WHERE p.remaining_amount > 0
+          AND {OUT} > 0
           AND p.on_date >= '{DATA_START_DATE}'
           AND p.status IN ('pending', 'approved')
           {date_sql}
@@ -2264,6 +2281,7 @@ def get_aging_snapshot(request):
                 "gross": gross,
                 "discPct": disc_pct,
                 "incGst": gross - discount_amount,
+                "outstanding": float(r["outstanding"] or 0),
                 "daysOverdue": days,
                 "lastFu": iso(r["follow_updated"]) or iso(r["last_fu"]),
                 "referred": iso(r["follow_referred"]),
