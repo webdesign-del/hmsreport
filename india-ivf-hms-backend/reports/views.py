@@ -2125,7 +2125,6 @@ def get_aging_snapshot(request):
         LEFT JOIN reports_agingfollowup f ON f.invoice = p.receipt_number
         {PAY_JOIN}
         WHERE p.remaining_amount > 0
-          AND {OUT} > 0
           AND p.on_date >= '{DATA_START_DATE}'
           AND p.status IN ('pending', 'approved')
           {date_sql}
