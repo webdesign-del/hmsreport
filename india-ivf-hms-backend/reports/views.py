@@ -2392,39 +2392,71 @@ def _advised_procedure_ids(raw):
     return [i for i in ids if not (i in seen or seen.add(i))]
 
 
-_VISITED_CACHE = {'at': 0.0, 'pids': set(), 'appts': set()}
+_VISITED_CACHE = {'at': 0.0, 'pids': set(), 'appts': set(), 'phones': set()}
+
+
+def _norm_phone(v):
+    """Digits only, last 10 (so +91 / spaces / leading 0 do not break a phone match)."""
+    d = ''.join(ch for ch in str(v or '') if ch.isdigit())
+    return d[-10:] if len(d) >= 10 else ''
 
 
 def _visited_patient_sets():
-    """Patients (and appointments) that actually came to the clinic: any in-clinic/visited/consultation
-    appointment status, any hms_consultation row, or any hms_patient_procedure row. Cached for 2 minutes."""
+    """Patients / appointments / phone numbers that actually came to the clinic: an in-clinic / visited /
+    consultation appointment status, a consultation, procedure, registration or investigation billing.
+    The HMS identifies a patient by phone (hms_patients.wife_phone), so a person who booked again under a
+    new IIC ID but has been seen before is matched by phone as well. Cached for 2 minutes."""
     now = _time_ds.time()
-    if now - _VISITED_CACHE['at'] < 120 and _VISITED_CACHE['at']:
-        return _VISITED_CACHE['pids'], _VISITED_CACHE['appts']
-    pids, appts = set(), set()
-    with connection.cursor() as cursor:
-        cursor.execute("""
-            SELECT DISTINCT TRIM(paitent_id) FROM hms_appointments
-            WHERE status IN ('in_clinic', 'visited', 'consultation', 'consultation_done')
-              AND paitent_id IS NOT NULL AND TRIM(paitent_id) <> ''
-        """)
-        pids.update(str(r[0]).strip() for r in cursor.fetchall() if r[0])
-        cursor.execute("SELECT DISTINCT TRIM(patient_id), appointment_id FROM hms_consultation")
-        for pid, appt in cursor.fetchall():
-            if pid:
-                pids.add(str(pid).strip())
-            if appt:
-                appts.add(str(appt).strip())
-        cursor.execute("SELECT DISTINCT TRIM(patient_id), appointment_id FROM hms_patient_procedure")
-        for pid, appt in cursor.fetchall():
-            if pid:
-                pids.add(str(pid).strip())
-            if appt:
-                appts.add(str(appt).strip())
+    if _VISITED_CACHE['at'] and now - _VISITED_CACHE['at'] < 120:
+        return _VISITED_CACHE['pids'], _VISITED_CACHE['appts'], _VISITED_CACHE['phones']
+    pids, appts, phones = set(), set(), set()
+
+    def run_safe(sql, handler):
+        # one bad / missing table must never break the whole prebook endpoint
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(sql)
+                for row in cursor.fetchall():
+                    handler(row)
+        except Exception:
+            pass
+
+    def add_pid(v):
+        if v and str(v).strip():
+            pids.add(str(v).strip())
+
+    def add_appt(v):
+        if v and str(v).strip():
+            appts.add(str(v).strip())
+
+    def add_phone(v):
+        ph = _norm_phone(v)
+        if ph:
+            phones.add(ph)
+
+    run_safe("""SELECT DISTINCT TRIM(paitent_id), wife_phone FROM hms_appointments
+                WHERE status IN ('in_clinic', 'visited', 'consultation', 'consultation_done')""",
+             lambda r: (add_pid(r[0]), add_phone(r[1])))
+    run_safe("SELECT DISTINCT TRIM(patient_id), appointment_id FROM hms_consultation",
+             lambda r: (add_pid(r[0]), add_appt(r[1])))
+    run_safe("SELECT DISTINCT TRIM(patient_id), appointment_id FROM hms_patient_procedure",
+             lambda r: (add_pid(r[0]), add_appt(r[1])))
+    run_safe("SELECT DISTINCT TRIM(patient_id) FROM hms_registation", lambda r: add_pid(r[0]))
+    run_safe("SELECT DISTINCT TRIM(patient_id) FROM hms_patient_investigations", lambda r: add_pid(r[0]))
+    # appointments behind a consultation / procedure -> their phone numbers
+    run_safe("""SELECT DISTINCT a.wife_phone FROM hms_consultation hc
+                JOIN hms_appointments a ON a.id = hc.appointment_id""", lambda r: add_phone(r[0]))
+    run_safe("""SELECT DISTINCT a.wife_phone FROM hms_patient_procedure p
+                JOIN hms_appointments a ON a.id = p.appointment_id""", lambda r: add_phone(r[0]))
+    # every patient id seen above -> the phone registered for it
+    seen_pids = set(pids)
+    run_safe("SELECT TRIM(patient_id), wife_phone FROM hms_patients",
+             lambda r: add_phone(r[1]) if (r[0] and str(r[0]).strip() in seen_pids) else None)
+
     pids.discard('')
     appts.discard('')
-    _VISITED_CACHE.update({'at': now, 'pids': pids, 'appts': appts})
-    return pids, appts
+    _VISITED_CACHE.update({'at': now, 'pids': pids, 'appts': appts, 'phones': phones})
+    return pids, appts, phones
 
 
 def get_prebook_data(request):
@@ -2456,6 +2488,7 @@ def get_prebook_data(request):
         SELECT
             a.id AS appt_id,
             TRIM(a.paitent_id) AS pid,
+            a.wife_phone AS phone,
             COALESCE(NULLIF(TRIM(a.paitent_id), ''), CAST(a.id AS CHAR)) AS id,
             a.wife_name AS name,
             DATE(a.appoitmented_date) AS date,
@@ -2536,11 +2569,12 @@ def get_prebook_data(request):
                 "centre": row["centre"] or "Unassigned",
                 "type": "scheduled",
             })
-        visited_pids, visited_appts = _visited_patient_sets()
+        visited_pids, visited_appts, visited_phones = _visited_patient_sets()
         seen_missed = set()
         for row in run(missed_query):
             pid = str(row.get("pid") or "").strip()
-            if (pid and pid in visited_pids) or str(row.get("appt_id")) in visited_appts:
+            phone = _norm_phone(row.get("phone"))
+            if (pid and pid in visited_pids) or str(row.get("appt_id")) in visited_appts or (phone and phone in visited_phones):
                 continue  # this patient did come at some point -> not a "never came" case
             if row["id"] in seen_missed:
                 continue  # one row per patient (latest missed appointment; query is ORDER BY date DESC)

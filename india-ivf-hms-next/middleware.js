@@ -55,8 +55,8 @@ export function middleware(request) {
   }
 
   // Prebook lists (Appointment Scheduled / Missed / Consulted Not Booked) are hidden
-  // from Doctor and Embryologist workspaces — block direct URL access too.
-  if (pathname.startsWith('/prebook') && (session.role === 'doctor' || session.role === 'embryologist')) {
+  // from Doctor, Embryologist and Accounts workspaces — block direct URL access too.
+  if (pathname.startsWith('/prebook') && (session.role === 'doctor' || session.role === 'embryologist' || session.role === 'accounts')) {
     return NextResponse.redirect(new URL('/dashboard', request.url));
   }
 

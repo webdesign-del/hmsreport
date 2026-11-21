@@ -19,9 +19,9 @@ export function isNavGroup(n: NavEntry): n is NavGroup {
 
 export const MGMT_NAV: NavEntry[] = [
   { href: "/dashboard", label: "Dashboard", ic: "▦" },
-  { href: "/prebook/scheduled", label: "Appointment Scheduled", ic: "📅", hideForRoles: ["doctor", "embryologist"] },
-  { href: "/prebook/missed", label: "Missed Appointments", ic: "⚑", hideForRoles: ["doctor", "embryologist"] },
-  { href: "/prebook/cnb", label: "Consulted Not Booked", ic: "◐", hideForRoles: ["doctor", "embryologist"] },
+  { href: "/prebook/scheduled", label: "Appointment Scheduled", ic: "📅", hideForRoles: ["doctor", "embryologist", "accounts"] },
+  { href: "/prebook/missed", label: "Missed Appointments", ic: "⚑", hideForRoles: ["doctor", "embryologist", "accounts"] },
+  { href: "/prebook/cnb", label: "Consulted Not Booked", ic: "◐", hideForRoles: ["doctor", "embryologist", "accounts"] },
   {
     group: "booked",
     label: "Booked Patient",
