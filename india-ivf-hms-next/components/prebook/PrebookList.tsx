@@ -422,7 +422,7 @@ export default function PrebookList({ type, prebook }: { type: PrebookType; preb
                     </td>
                     <td className="strong">{p.name}</td>
                     <td>{fmtDate(p.date)}</td>
-                    <td>{p.centre} Centre</td>
+                    <td>{p.centre}</td>
                   </tr>
                 ))}
               </tbody>
