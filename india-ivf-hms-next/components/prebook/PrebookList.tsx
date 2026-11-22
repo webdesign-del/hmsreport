@@ -167,7 +167,10 @@ export default function PrebookList({ type, prebook }: { type: PrebookType; preb
   }
 
   function setDraft(id: string, patch: Partial<CommentDraft>) {
-    setDrafts((s) => ({ ...s, [id]: { text: "", date: TODAY, ...s[id], ...patch } }));
+    setDrafts((s) => {
+      const prev: CommentDraft = s[id] ?? { text: "", date: TODAY };
+      return { ...s, [id]: { ...prev, ...patch } };
+    });
     setCommentError((s) => ({ ...s, [id]: "" }));
   }
 
