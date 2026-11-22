@@ -36,6 +36,16 @@ export interface Patient {
   packages?: PackageLine[];
 }
 
+export interface CnbComment {
+  id: number | string;
+  text: string;
+  /** date the patient was connected (ISO), may be empty */
+  date: string;
+  by: string;
+  /** when the comment was written (ISO datetime), empty for earlier single-box entries */
+  at: string;
+}
+
 export interface PrebookPatient {
   id: string;
   name: string;
@@ -49,6 +59,8 @@ export interface PrebookPatient {
   fcComment?: string;
   lastConn?: string;
   lastComment?: string;
+  /** Consulted-Not-Booked comment log, newest first (append-only) */
+  comments?: CnbComment[];
 }
 
 export type JourneySubject = Patient | PrebookPatient;
@@ -111,6 +123,8 @@ export interface AgingPatient {
   incGst: number;
   /** Aging list: outstanding after approved / pending partial payments (from the backend) */
   outstanding?: number;
+  /** Treatment complete: the patient has an embryo transfer on record */
+  completed?: boolean;
   milestone: string;
   daysOverdue: number;
   lastFu: string;

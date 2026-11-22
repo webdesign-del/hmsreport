@@ -170,6 +170,8 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
   const [localPatients, setLocalPatients] = useState<AgingPatient[]>(patients);
   const [bucket, setBucket] = useState<number | null>(null);
   const [search, setSearch] = useState("");
+  // Treatment status: complete = embryo transfer on record, ongoing = everything else
+  const [completion, setCompletion] = useState<"all" | "complete" | "ongoing">("all");
   const [range, setRange] = useState("all");
   const [single, setSingle] = useState(TODAY);
   const [from, setFrom] = useState("2026-01-01");
@@ -609,10 +611,15 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
     }
   }
 
-  const bucketCounts = useMemo(() => [0, 1, 2, 3, 4].map((i) => localPatients.filter((p) => bucketIdx(p.daysOverdue) === i).length), [localPatients]);
+  // Patients after the Complete / Ongoing choice; the bucket pills count within this set.
+  const byCompletion = useMemo(
+    () => (completion === "all" ? localPatients : localPatients.filter((p) => (completion === "complete" ? !!p.completed : !p.completed))),
+    [localPatients, completion]
+  );
+  const bucketCounts = useMemo(() => [0, 1, 2, 3, 4].map((i) => byCompletion.filter((p) => bucketIdx(p.daysOverdue) === i).length), [byCompletion]);
 
   const filtered = useMemo(() => {
-    let list = localPatients.slice();
+    let list = byCompletion.slice();
     if (bucket !== null) list = list.filter((p) => bucketIdx(p.daysOverdue) === bucket);
     list = list.filter((p) => inDateRange(p.lastFu, range, single, from, to));
     const q = search.trim().toLowerCase();
@@ -621,11 +628,11 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
         [p.name, p.id, p.invoice].some((v) => String(v ?? "").toLowerCase().includes(q))
       );
     return list;
-  }, [localPatients, bucket, range, single, from, to, search]);
+  }, [byCompletion, bucket, range, single, from, to, search]);
 
   useEffect(() => {
     setPage(1);
-  }, [bucket, range, single, from, to, search, pageSize]);
+  }, [bucket, completion, range, single, from, to, search, pageSize]);
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
   const safePage = Math.min(page, totalPages);
@@ -673,7 +680,7 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
   useEffect(() => {
     if (!pendingJump) return;
     const idx = filtered.findIndex((p) => p.invoice === pendingJump);
-    const noFilters = bucket === null && !search && range === "all";
+    const noFilters = bucket === null && !search && range === "all" && completion === "all";
     if (idx < 0) {
       if (noFilters) {
         setPendingJump(null);
@@ -693,7 +700,7 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
     setHighlight(pendingJump);
     setPendingJump(null);
     setTimeout(() => setHighlight(null), 5000);
-  }, [pendingJump, filtered, safePage, pageSize, bucket, search, range]);
+  }, [pendingJump, filtered, safePage, pageSize, bucket, search, range, completion]);
 
   function goToComment(n: Notif) {
     setNotifOpen(false);
@@ -701,6 +708,7 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
     setBucket(null);
     setSearch("");
     setRange("all");
+    setCompletion("all");
     setPendingJump(n.invoice);
   }
 
@@ -770,6 +778,16 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
             onChange={(e) => setSearch(e.target.value)}
             className="w-[220px] rounded-[8px] border border-border bg-surface px-2.5 py-1.5 text-[11.5px] outline-none focus:border-primary"
           />
+          <select
+            value={completion}
+            onChange={(e) => setCompletion(e.target.value as "all" | "complete" | "ongoing")}
+            className="rounded-[8px] border border-border bg-surface px-2.5 py-1.5 text-[11.5px]"
+            title="Treatment status"
+          >
+            <option value="all">All status</option>
+            <option value="ongoing">Ongoing</option>
+            <option value="complete">Complete</option>
+          </select>
           <select value={range} onChange={(e) => setRange(e.target.value)} className="rounded-[8px] border border-border bg-surface px-2.5 py-1.5 text-[11.5px]">
             <option value="all">All time</option>
             <option value="date">Specific date</option>
@@ -837,7 +855,7 @@ export default function AgingPatientList({ patients, centres = [] }: { patients:
             onClick={() => setBucket(null)}
             className={`rounded-full border px-3 py-1.5 text-[11.5px] font-semibold transition-colors ${bucket === null ? "border-primary bg-primary-soft text-primary-dark" : "border-border text-text-mid hover:border-primary"}`}
           >
-            All <span className="ml-1 text-text-soft">{localPatients.length}</span>
+            All <span className="ml-1 text-text-soft">{byCompletion.length}</span>
           </button>
           {BUCKET_LABELS.map((l, i) => (
             <button

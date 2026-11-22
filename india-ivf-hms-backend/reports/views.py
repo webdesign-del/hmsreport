@@ -392,6 +392,63 @@ def get_cnb_data(request):
     return JsonResponse(results, safe=False)
 
 
+def ensure_cnb_comment_table():
+    with connection.cursor() as cursor:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS reports_cnbcomment (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                patient_id VARCHAR(64) NOT NULL,
+                comment TEXT NOT NULL,
+                connected_date DATE NULL,
+                created_by VARCHAR(120) NOT NULL DEFAULT '',
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                KEY idx_cnbcomment_patient (patient_id)
+            )
+        """)
+
+
+def _cnb_comment_item(cid, text, connected, by, at):
+    return {
+        "id": cid,
+        "text": text or "",
+        "date": connected.isoformat() if hasattr(connected, "isoformat") else (str(connected) if connected else ""),
+        "by": by or "",
+        "at": at.strftime('%Y-%m-%dT%H:%M:%S') if hasattr(at, "strftime") else (str(at) if at else ""),
+    }
+
+
+@csrf_exempt
+def add_cnb_comment(request):
+    """Append-only comment log for a Consulted-Not-Booked patient. There is deliberately no edit / delete."""
+    if request.method != 'POST':
+        return JsonResponse({'status': 'error', 'message': 'Use POST.'}, status=405)
+    try:
+        data = json.loads(request.body or b'{}')
+        patient_id = str(data.get('patient_id') or '').strip()
+        comment = str(data.get('comment') or '').strip()
+        connected = str(data.get('connected_date') or '').strip()
+        created_by = str(data.get('created_by') or '').strip()[:120]
+        if not patient_id or patient_id.lower() == 'none' or patient_id == '\u2014':
+            return JsonResponse({'status': 'error', 'message': 'Patient id missing.'}, status=400)
+        if not comment:
+            return JsonResponse({'status': 'error', 'message': 'Write a comment first.'}, status=400)
+        comment = comment[:2000]
+        if not _re_ds.match(r'^\d{4}-\d{2}-\d{2}$', connected):
+            connected = date.today().isoformat()
+        ensure_cnb_comment_table()
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO reports_cnbcomment (patient_id, comment, connected_date, created_by) VALUES (%s, %s, %s, %s)",
+                [patient_id, comment, connected, created_by])
+            cursor.execute(
+                "SELECT id, comment, connected_date, created_by, created_at FROM reports_cnbcomment "
+                "WHERE patient_id = %s ORDER BY id DESC", [patient_id])
+            items = [_cnb_comment_item(r[0], r[1], r[2], r[3], r[4]) for r in cursor.fetchall()]
+        return JsonResponse({'status': 'success', 'comments': items})
+    except Exception as e:
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+
+
 @csrf_exempt 
 def save_cnb_edits(request):
     if request.method == 'POST':
@@ -2212,6 +2269,19 @@ def get_aging_snapshot(request):
 
         today_date = date.today()
 
+        # Treatment complete = the patient (or this invoice) has a row in the embryo_transfer table.
+        et_patients, et_receipts = set(), set()
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT DISTINCT TRIM(patient_id), TRIM(receipt_number) FROM embryo_transfer")
+                for et_pid, et_rcpt in cursor.fetchall():
+                    if et_pid:
+                        et_patients.add(str(et_pid).strip())
+                    if et_rcpt:
+                        et_receipts.add(str(et_rcpt).strip())
+        except Exception:
+            et_patients, et_receipts = set(), set()
+
         receipt_numbers = [r["invoice"] for r in rows if r["invoice"]]
         payments_by_receipt = {}
         if receipt_numbers:
@@ -2281,6 +2351,9 @@ def get_aging_snapshot(request):
                 "discPct": disc_pct,
                 "incGst": gross - discount_amount,
                 "outstanding": float(r["outstanding"] or 0),
+                "completed": bool(
+                    str(r["id"] or "").strip() in et_patients or str(r["invoice"] or "").strip() in et_receipts
+                ),
                 "daysOverdue": days,
                 "lastFu": iso(r["follow_updated"]) or iso(r["last_fu"]),
                 "referred": iso(r["follow_referred"]),
@@ -2624,6 +2697,27 @@ def get_prebook_data(request):
                 ids = []
             return [proc_names[i] for i in ids if proc_names.get(i)]
 
+        # Comment log per patient (newest first). Old single-box values (FC comment / latest comment) are shown
+        # as the oldest entries so nothing already written is lost.
+        comments_by_pid = {}
+        try:
+            ensure_cnb_comment_table()
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT id, patient_id, comment, connected_date, created_by, created_at "
+                               "FROM reports_cnbcomment ORDER BY id DESC")
+                for cid, pid, text, conn_date, by, at in cursor.fetchall():
+                    comments_by_pid.setdefault(str(pid).strip(), []).append(_cnb_comment_item(cid, text, conn_date, by, at))
+        except Exception:
+            comments_by_pid = {}
+
+        def comment_list(row):
+            items = list(comments_by_pid.get(str(row["id"]).strip(), []))
+            if row.get("saved_last_comment"):
+                items.append(_cnb_comment_item("legacy-latest", row["saved_last_comment"], row.get("saved_last_conn"), "earlier entry", ""))
+            if row.get("saved_fc_comment"):
+                items.append(_cnb_comment_item("legacy-fc", row["saved_fc_comment"], None, "earlier entry", ""))
+            return items
+
         for row in cnb_rows:
             if row["id"] in seen_cnb_ids:
                 continue
@@ -2641,6 +2735,7 @@ def get_prebook_data(request):
                 "fcComment": row["saved_fc_comment"] or "",
                 "lastConn": iso(row["saved_last_conn"]),
                 "lastComment": row["saved_last_comment"] or "",
+                "comments": comment_list(row),
             })
 
         response = JsonResponse(results, safe=False)

@@ -40,6 +40,7 @@ urlpatterns = [
     path('api/logout/', views.logout_view, name='api_logout'),
     path('api/get_cnb_data/', views.get_cnb_data, name='get_cnb_data'),
     path('api/save_cnb_edits/', views.save_cnb_edits, name='save_cnb_edits'),
+    path('api/add_cnb_comment/', views.add_cnb_comment, name='add_cnb_comment'),
     path('api/get_procedure_billing_data/', views.get_procedure_billing_data, name='get_procedure_billing_data'),
     path('api/get_dynamic_booked_patients/', views.get_dynamic_booked_patients, name='get_dynamic_booked_patients'),
     path('api/get_patient_profile_detail/', views.get_patient_profile_detail, name='get_patient_profile_detail'),

@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { TODAY, fmtDate } from "@/lib/format";
-import type { PrebookPatient, PrebookType } from "@/lib/types";
+import type { CnbComment, PrebookPatient, PrebookType } from "@/lib/types";
 import { Card, PageHead, TableWrap } from "@/components/ui";
 import { getClientSession, isReadOnlyRole } from "@/lib/clientSession";
 
@@ -40,9 +40,11 @@ const QUALITY_CLS: Record<string, string> = { Hot: "bg-red-soft text-red", Cold:
 
 interface CnbEdit {
   quality?: (typeof QUALITIES)[number];
-  fcComment?: string;
-  lastConn?: string;
-  lastComment?: string;
+}
+
+interface CommentDraft {
+  text: string;
+  date: string;
 }
 
 type SaveState = "saving" | "saved" | "error";
@@ -60,6 +62,11 @@ export default function PrebookList({ type, prebook }: { type: PrebookType; preb
   const [search, setSearch] = useState("");
   const [edits, setEdits] = useState<Record<string, CnbEdit>>({});
   const [saveState, setSaveState] = useState<Partial<Record<string, SaveState>>>({});
+  // Comment log: drafts being typed, and the full comment list per patient once a comment was added here.
+  const [drafts, setDrafts] = useState<Record<string, CommentDraft>>({});
+  const [commentLists, setCommentLists] = useState<Record<string, CnbComment[]>>({});
+  const [commentState, setCommentState] = useState<Partial<Record<string, "saving" | "error">>>({});
+  const [commentError, setCommentError] = useState<Record<string, string>>({});
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(50);
 
@@ -131,18 +138,9 @@ export default function PrebookList({ type, prebook }: { type: PrebookType; preb
     setReadOnly(isReadOnlyRole(getClientSession()?.role));
   }, []);
 
-  function setEdit(id: string, field: keyof CnbEdit, value: string) {
-    setEdits((s) => ({ ...s, [id]: { ...s[id], [field]: value as never } }));
-    setSaveState((s) => ({ ...s, [id]: undefined }));
-  }
-
-  async function saveRow(p: PrebookPatient) {
-    const e = edits[p.id] || {};
-    const quality = e.quality || p.quality || "Cold";
-    const fcComment = e.fcComment ?? p.fcComment ?? "";
-    const lastConn = e.lastConn ?? p.lastConn ?? "";
-    const lastComment = e.lastComment ?? p.lastComment ?? "";
-
+  // Quality is the only editable field; it saves as soon as it is changed.
+  async function saveQuality(p: PrebookPatient, quality: (typeof QUALITIES)[number]) {
+    setEdits((s) => ({ ...s, [p.id]: { ...s[p.id], quality } }));
     setSaveState((s) => ({ ...s, [p.id]: "saving" }));
     try {
       const res = await fetch("/api/cnb-edits", {
@@ -153,9 +151,10 @@ export default function PrebookList({ type, prebook }: { type: PrebookType; preb
             {
               patient_id: p.id,
               quality,
-              fc_comment: fcComment,
-              latest_connected_date: lastConn || null,
-              latest_comment: lastComment,
+              // keep the earlier single-box values untouched
+              fc_comment: p.fcComment ?? "",
+              latest_connected_date: p.lastConn || null,
+              latest_comment: p.lastComment ?? "",
             },
           ],
         }),
@@ -164,6 +163,42 @@ export default function PrebookList({ type, prebook }: { type: PrebookType; preb
       setSaveState((s) => ({ ...s, [p.id]: "saved" }));
     } catch {
       setSaveState((s) => ({ ...s, [p.id]: "error" }));
+    }
+  }
+
+  function setDraft(id: string, patch: Partial<CommentDraft>) {
+    setDrafts((s) => ({ ...s, [id]: { text: "", date: TODAY, ...s[id], ...patch } }));
+    setCommentError((s) => ({ ...s, [id]: "" }));
+  }
+
+  // Add one more comment to the log. Saved comments can never be edited or deleted.
+  async function addComment(p: PrebookPatient) {
+    const d = drafts[p.id] || { text: "", date: TODAY };
+    const text = d.text.trim();
+    if (!text) {
+      setCommentError((s) => ({ ...s, [p.id]: "Write a comment first." }));
+      return;
+    }
+    setCommentState((s) => ({ ...s, [p.id]: "saving" }));
+    try {
+      const res = await fetch("/api/cnb-comment", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          patient_id: p.id,
+          comment: text,
+          connected_date: d.date || TODAY,
+          created_by: getClientSession()?.name || "",
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.status !== "success") throw new Error(data.message || "save failed");
+      setCommentLists((s) => ({ ...s, [p.id]: data.comments as CnbComment[] }));
+      setDrafts((s) => ({ ...s, [p.id]: { text: "", date: TODAY } }));
+      setCommentState((s) => ({ ...s, [p.id]: undefined }));
+    } catch (err) {
+      setCommentState((s) => ({ ...s, [p.id]: "error" }));
+      setCommentError((s) => ({ ...s, [p.id]: err instanceof Error ? err.message : "Could not save the comment." }));
     }
   }
 
@@ -287,29 +322,35 @@ export default function PrebookList({ type, prebook }: { type: PrebookType; preb
       />
 
       <Card flush>
-        <TableWrap>
+        {/* CNB: the table scrolls inside this box, so the header row and the first four columns
+            (SN, IIC ID, Patient Name, Date of Consult) stay pinned while the rest scrolls. */}
+        <TableWrap
+          className={
+            type === "cnb"
+              ? "max-h-[calc(100vh-170px)] overflow-y-auto [&_thead_th]:sticky [&_thead_th]:top-0 [&_thead_th]:z-[3] [&_thead_th.sticky-l]:z-[5] [&_thead_th.sticky-l2]:z-[5] [&_thead_th.sticky-l3]:z-[5]"
+              : ""
+          }
+        >
           {type === "cnb" ? (
             <table className="tbl">
               <thead>
                 <tr>
-                  <th>SN</th>
-                  <th>IIC ID</th>
-                  <th>Patient Name</th>
-                  <th>Date of Consult</th>
+                  <th className="sticky-l" style={{ width: 56, minWidth: 56, maxWidth: 56 }}>SN</th>
+                  <th className="sticky-l2" style={{ left: 56, width: 150, minWidth: 150, maxWidth: 150 }}>IIC ID</th>
+                  <th className="sticky-l2" style={{ left: 206, width: 200, minWidth: 200, maxWidth: 200 }}>Patient Name</th>
+                  <th className="sticky-l3" style={{ left: 406, width: 120, minWidth: 120, maxWidth: 120 }}>Date of Consult</th>
                   <th>Centre</th>
                   <th>Doctor</th>
                   <th>Treatment Advised</th>
                   <th>Quality</th>
-                  <th>FC Comment</th>
-                  <th>Latest Connected Date</th>
-                  <th>Latest Comment</th>
-                  <th>Action</th>
+                  <th>Comments</th>
+                  <th>Add Comment</th>
                 </tr>
               </thead>
               <tbody>
                 {list.length === 0 && (
                   <tr>
-                    <td colSpan={12} className="text-center text-text-soft">
+                    <td colSpan={10} className="text-center text-text-soft">
                       No patients match the current filter.
                     </td>
                   </tr>
@@ -317,21 +358,25 @@ export default function PrebookList({ type, prebook }: { type: PrebookType; preb
                 {paged.map((p, n) => {
                   const e = edits[p.id] || {};
                   const quality = e.quality || p.quality || "Cold";
+                  const comments = commentLists[p.id] ?? p.comments ?? [];
+                  const draft = drafts[p.id] || { text: "", date: TODAY };
                   return (
                     <tr key={`${p.id}-${pageStart + n}`}>
-                      <td className="sn-col">{pageStart + n + 1}</td>
-                      <td>
+                      <td className="sn-col sticky-l" style={{ width: 56, minWidth: 56, maxWidth: 56 }}>{pageStart + n + 1}</td>
+                      <td className="sticky-l2" style={{ left: 56, width: 150, minWidth: 150, maxWidth: 150 }}>
                         <Link href={`/journey?id=${p.id}`} className="iic-link">
                           {p.id}
                         </Link>
                       </td>
-                      <td className="strong">{p.name}</td>
-                      <td>{fmtDate(p.date)}</td>
+                      <td className="strong sticky-l2" style={{ left: 206, width: 200, minWidth: 200, maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis" }} title={p.name}>
+                        {p.name}
+                      </td>
+                      <td className="sticky-l3" style={{ left: 406, width: 120, minWidth: 120, maxWidth: 120 }}>{fmtDate(p.date)}</td>
                       <td>{p.centre}</td>
                       <td>{p.doctor || "—"}</td>
                       <td>{p.treatment || "—"}</td>
                       <td>
-                        <select value={quality} disabled={readOnly} onChange={(e2) => setEdit(p.id, "quality", e2.target.value)} className="rounded-[6px] border border-border bg-surface px-1.5 py-1 text-[11px]">
+                        <select value={quality} disabled={readOnly} onChange={(e2) => saveQuality(p, e2.target.value as (typeof QUALITIES)[number])} className="rounded-[6px] border border-border bg-surface px-1.5 py-1 text-[11px]">
                           {QUALITIES.map((q) => (
                             <option key={q} value={q}>
                               {q}
@@ -339,49 +384,62 @@ export default function PrebookList({ type, prebook }: { type: PrebookType; preb
                           ))}
                         </select>
                         <div className={`mt-1 inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10.5px] font-semibold ${QUALITY_CLS[quality]}`}>{quality}</div>
+                        {saveState[p.id] === "saving" && <div className="mt-1 text-[10.5px] text-text-soft">Saving…</div>}
+                        {saveState[p.id] === "saved" && <div className="mt-1 text-[10.5px] font-semibold text-green">Saved ✓</div>}
+                        {saveState[p.id] === "error" && <div className="mt-1 text-[10.5px] font-semibold text-red">Save failed</div>}
                       </td>
                       <td>
-                        <textarea
-                          rows={2}
-                          disabled={readOnly}
-                          defaultValue={e.fcComment ?? p.fcComment ?? ""}
-                          onBlur={(e2) => setEdit(p.id, "fcComment", e2.target.value)}
-                          className="w-[180px] rounded-[6px] border border-border bg-surface px-2 py-1 text-[11px]"
-                        />
-                      </td>
-                      <td>
-                        <input
-                          type="date"
-                          disabled={readOnly}
-                          defaultValue={e.lastConn ?? p.lastConn ?? ""}
-                          onChange={(e2) => setEdit(p.id, "lastConn", e2.target.value)}
-                          className="rounded-[6px] border border-border bg-surface px-1.5 py-1 text-[11px]"
-                        />
-                      </td>
-                      <td>
-                        <textarea
-                          rows={2}
-                          disabled={readOnly}
-                          defaultValue={e.lastComment ?? p.lastComment ?? ""}
-                          onBlur={(e2) => setEdit(p.id, "lastComment", e2.target.value)}
-                          className="w-[180px] rounded-[6px] border border-border bg-surface px-2 py-1 text-[11px]"
-                        />
+                        {comments.length === 0 ? (
+                          <span className="text-[11px] text-text-soft">No comments yet</span>
+                        ) : (
+                          <div className="scroll-thin max-h-[120px] w-[300px] space-y-1.5 overflow-y-auto pr-1">
+                            {comments.map((c) => (
+                              <div key={c.id} className="rounded-[6px] border border-border-soft bg-surface-2 px-2 py-1 text-[11px] leading-snug">
+                                <div className="whitespace-pre-wrap break-words text-text">{c.text}</div>
+                                <div className="mt-0.5 text-[10px] text-text-soft">
+                                  {c.date ? `Connected ${fmtDate(c.date)}` : ""}
+                                  {c.date && (c.by || c.at) ? " · " : ""}
+                                  {c.by}
+                                  {c.at ? ` · ${new Date(c.at).toLocaleString()}` : ""}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        )}
                       </td>
                       <td>
                         {readOnly ? (
                           <span className="text-[10.5px] text-text-soft">View only</span>
                         ) : (
-                        <button
-                          type="button"
-                          onClick={() => saveRow(p)}
-                          disabled={saveState[p.id] === "saving"}
-                          className="rounded-[8px] bg-primary px-2.5 py-1 text-[11px] font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
-                        >
-                          {saveState[p.id] === "saving" ? "Saving…" : "Save"}
-                        </button>
+                          <div className="w-[230px] space-y-1">
+                            <textarea
+                              rows={2}
+                              value={draft.text}
+                              onChange={(e2) => setDraft(p.id, { text: e2.target.value })}
+                              placeholder="Write a new comment…"
+                              className="w-full rounded-[6px] border border-border bg-surface px-2 py-1 text-[11px]"
+                            />
+                            <div className="flex items-center gap-1.5">
+                              <input
+                                type="date"
+                                value={draft.date}
+                                max={TODAY}
+                                onChange={(e2) => setDraft(p.id, { date: e2.target.value })}
+                                title="Date the patient was connected"
+                                className="rounded-[6px] border border-border bg-surface px-1.5 py-1 text-[11px]"
+                              />
+                              <button
+                                type="button"
+                                onClick={() => addComment(p)}
+                                disabled={commentState[p.id] === "saving"}
+                                className="rounded-[8px] bg-primary px-2.5 py-1 text-[11px] font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
+                              >
+                                {commentState[p.id] === "saving" ? "Adding…" : "Add"}
+                              </button>
+                            </div>
+                            {commentError[p.id] && <div className="text-[10.5px] font-semibold text-red">{commentError[p.id]}</div>}
+                          </div>
                         )}
-                        {saveState[p.id] === "saved" && <div className="mt-1 text-[10.5px] font-semibold text-green">Saved ✓</div>}
-                        {saveState[p.id] === "error" && <div className="mt-1 text-[10.5px] font-semibold text-red">Save failed</div>}
                       </td>
                     </tr>
                   );
