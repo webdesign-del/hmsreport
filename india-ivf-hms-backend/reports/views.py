@@ -2535,8 +2535,8 @@ def _visited_patient_sets():
 def get_prebook_data(request):
     center_id = request.GET.get('center_id')
     appt_centre_filter_sql = "AND a.center = %s" if center_id else ""
-    # Missed appointments: the clinic the patient was booked to visit is appoitment_for; a.center is only the
-    # booking (call-centre) side, which is the "IndiaIVF" head-office placeholder for many rows.
+    # Scheduled + Missed appointments: the clinic the patient was booked to visit is appoitment_for; a.center is only
+    # the booking (call-centre) side, which is the "IndiaIVF" head-office placeholder for many rows.
     missed_centre_filter_sql = "AND COALESCE(NULLIF(TRIM(a.appoitment_for), ''), a.center) = %s" if center_id else ""
     cnb_centre_filter_sql = "AND hc.billing_at = %s" if center_id else ""
     centre_params = [center_id] if center_id else []
@@ -2546,13 +2546,14 @@ def get_prebook_data(request):
             COALESCE(NULLIF(TRIM(a.paitent_id), ''), CAST(a.id AS CHAR)) AS id,
             a.wife_name AS name,
             DATE(a.appoitmented_date) AS date,
-            c.center_name AS centre
+            COALESCE(cf.center_name, c.center_name) AS centre
         FROM hms_appointments a
         LEFT JOIN hms_centers c ON a.center = c.center_number
+        LEFT JOIN hms_centers cf ON cf.center_number = NULLIF(TRIM(a.appoitment_for), '')
         WHERE a.status = 'booked'
           AND a.appoitmented_date >= '{DATA_START_DATE}'
           {ds_a()}
-          {appt_centre_filter_sql}
+          {missed_centre_filter_sql}
         ORDER BY a.appoitmented_date DESC;
     """
 
